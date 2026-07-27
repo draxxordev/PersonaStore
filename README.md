@@ -198,6 +198,8 @@ so developers can spend more time building games rather than persistence infrast
 
 # License
 
+#MIT License
+
 Open-source for the Roblox Development community.
 
 I've linked other really good DataStoreService modules as well in the sources folder.
