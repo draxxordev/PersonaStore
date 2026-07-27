@@ -436,4 +436,4 @@ PersonaStore is now a **genuinely robust, enterprise-grade persistence framework
 
 ## Credits
 
-Special thanks to the code review for catching these critical issues before they caused production data loss. These fixes make PersonaStore worthy of being compared to major open-source persistence frameworks like ProfileStore, but with significantly more features.
+Special thanks to the code reviewer (and me) for catching these critical issues before they caused production data loss. These fixes make PersonaStore worthy of being compared to major open-source persistence frameworks like ProfileStore, but with significantly more features.
