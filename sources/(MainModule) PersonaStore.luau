@@ -5,10 +5,11 @@
     PersonaStore - A ProfileStore-inspired DataStore library built
     entirely with an OOP architecture, explicit data isolation, session
     locking, observable state tracking, and cross-server synchronization.
-    
-    Now enhanced with EncodingService integration, compression, hashing, and advanced APIs.
+
+    Now enhanced with EncodingService integration, compression, hashing, advanced APIs,
+    OrderedDataStore + MemoryStore wrappers, and DataStore Version APIs.
     ========================================================================================
-    
+
     Description:
         A robust DataStore engine that manages player persistence profiles.
         It uses OOP, explicit data isolation, cross-server concurrency handlers,
@@ -27,6 +28,12 @@
         4. CompressionHandler (EncodingService Wrapper):
            Manages compression, decompression, hashing, and base64 encoding using
            native Roblox EncodingService for efficient serialization.
+        5. OrderedFounder (OrderedDataStore Wrapper):
+           A thin, retry-wrapped interface over GetOrderedDataStore, intended for
+           leaderboards and other strictly-numeric sorted keys.
+        6. MemoryQueueWrapper / MemorySortedMapWrapper (MemoryStoreService Wrappers):
+           Retry-wrapped interfaces over MemoryStoreService queues and sorted maps for
+           high-throughput, short-lived, in-memory-tier data.
 
     Advanced Features:
         - Multi-Level Initializer Pipeline via .new() and :CreateDataStore() factories.
@@ -34,25 +41,32 @@
         - High-Fidelity Deep Observable Proxy Tree to track nested mutation events.
         - Distributed Messaging Cluster Network to clear stale session locks instantly.
         - High-Efficiency Selective Data Patching to minimize network overhead.
+        - Configurable Integrity Modes (Full / HashOnlyOnFullSave / PerField) so patch
+          saves on large profiles don't have to rehash the entire document every time.
         - On-Demand Cache Verification Layer to prevent stale reads.
         - Live Cross-Server Global Updates (online push + offline queue).
         - Resilient Retry Layer with exponential backoff + jitter.
         - Engine-wide BindToClose drain with automatic session cleanup.
-        - Native EncodingService compression (Deflate/ZSTD) with configurable levels.
-        - Data integrity verification using cryptographic hashing (SHA256, SHA1, MD5).
+        - Native EncodingService compression (Zstd) with configurable levels,
+          with the algorithm used recorded per-profile so decompression is always
+          correct even after global settings change.
+        - Data integrity verification using cryptographic hashing (Sha256).
         - Read-only profile access without acquiring session locks.
         - Atomic counter operations for leaderboards and currencies.
         - Batch profile operations for mass updates and migrations.
+        - OrderedDataStore wrapper for numeric leaderboards.
+        - MemoryStoreService Queue + SortedMap wrappers.
+        - DataStore Version APIs: ListVersionsAsync / GetVersionAsync / RemoveVersionAsync.
         - Comprehensive statistics and audit logging.
         - Data export/import for backups and migrations.
         - Compression caching to avoid recompressing unchanged data.
-        
+
     Built with time, effort, love, and passion for the Roblox Developer Community <3.
-    
+
     Github(repository):
     https://github.com/draxxordev/PersonaStore
-    
-    v.1.1.0
+
+    v.1.2.0 [7/27/2026]
     By @Draxxor
 ]]--
 
@@ -63,6 +77,7 @@ export type table =
 --// Services
 local DataStoreService = game:GetService("DataStoreService")
 local MessagingService = game:GetService("MessagingService")
+local MemoryStoreService = game:GetService("MemoryStoreService")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
@@ -74,62 +89,79 @@ local EncodingService = game:GetService("EncodingService")
 local PersonaStore = {
 	EngineActive = false,
 	RegisteredStores = {}, -- storeName -> Founder instance, used by the message router
+	RegisteredOrderedStores = {}, -- storeName -> OrderedFounder instance
+	RegisteredMemoryQueues = {}, -- name -> MemoryQueueWrapper instance
+	RegisteredMemorySortedMaps = {}, -- name -> MemorySortedMapWrapper instance
 	GlobalLockTimeout = 120,
 	GlobalAutoSaveInterval = 30,
 	ClusterTopic = "PersonaStore_Cluster_Signals",
-	CompressionAlgorithm = Enum.CompressionAlgorithm.Deflate, -- or ZSTD for better compression
+	CompressionAlgorithm = Enum.CompressionAlgorithm.Zstd,
 	CompressionLevel = 6, -- 1-22 depending on algorithm
 	EnableDataIntegrityChecks = true,
-	HashAlgorithm = Enum.HashAlgorithm.SHA256,
+	HashAlgorithm = Enum.HashAlgorithm.Sha256,
 	EnableCompressionCache = true,
+
+	-- IntegrityMode controls how expensive a SavePatch() hash pass is:
+	--   "Full"                -> (default/back-compat) rehash the ENTIRE profile every SavePatch.
+	--   "HashOnlyOnFullSave"  -> SavePatch never hashes; DataHash only refreshes on a full Save().
+	--   "PerField"            -> SavePatch only rehashes the fields that were actually mutated,
+	--                            tracked in a FieldHashes table. Cheap even with huge sibling fields
+	--                            (e.g. a 50,000-item Inventory) as long as those fields stay clean.
+	IntegrityMode = "Full",
 }
 
 --// Constants (DO NOT TOUCH UNLESS YOU KNOW WHAT YOU'RE DOING!)
 PersonaStore.__index = PersonaStore
 PersonaStore._messagingConnection = nil
 PersonaStore._bindToCloseRegistered = false
-PersonaStore._compressionCache = {}
 PersonaStore._statistics = {
 	TotalSaves = 0,
 	TotalLoads = 0,
-	TotalCompressions = 0,
-	TotalDecompressions = 0,
 	DatastoreRequestsAttempted = 0,
 	DatastoreRequestsFailed = 0,
-	BytesSavedByCompression = 0,
 }
 
 --// Private Utility Functions (Internal Use Only)
 
 local CompressionHandler = {}
 
+-- Resolve a serialized algorithm string (e.g. tostring(Enum.CompressionAlgorithm.Deflate))
+-- back into the actual enum. Needed because profiles are decompressed with whatever
+-- algorithm they were ORIGINALLY compressed with, not whatever the engine's current
+-- global default happens to be.
+local function resolveCompressionAlgorithm(serializedAlgorithm: string?): any?
+	if not serializedAlgorithm then
+		return nil
+	end
+
+	for _, algorithmEnum in ipairs(Enum.CompressionAlgorithm:GetEnumItems()) do
+		if tostring(algorithmEnum) == serializedAlgorithm then
+			return algorithmEnum
+		end
+	end
+
+	return nil
+end
+
 -- Compress a table by JSON encoding, then using EncodingService:CompressBuffer
-function CompressionHandler.compress(data: table, algorithm: any?, level: number?): buffer
-	local algo = algorithm or PersonaStore.CompressionAlgorithm
-	local lvl = level or PersonaStore.CompressionLevel
+function CompressionHandler.compress(data: table): buffer
+	local json = HttpService:JSONEncode(data)
+	local buf = buffer.fromstring(json)
 
-	local jsonString = HttpService:JSONEncode(data)
-	local dataBuffer = buffer.fromstring(jsonString)
-
-	local compressed = EncodingService:CompressBuffer(dataBuffer, algo, lvl)
-	PersonaStore._statistics.TotalCompressions += 1
-	PersonaStore._statistics.BytesSavedByCompression += buffer.len(dataBuffer) - buffer.len(compressed)
-
-	return compressed
+	return EncodingService:CompressBuffer(
+		buf,
+		PersonaStore.CompressionAlgorithm,
+		PersonaStore.CompressionLevel
+	)
 end
 
--- Decompress a buffer back to a table
-function CompressionHandler.decompress(compressed: buffer): table
-	local decompressed = EncodingService:DecompressBuffer(compressed, PersonaStore.CompressionAlgorithm)
-	PersonaStore._statistics.TotalDecompressions += 1
-
-	local jsonString = buffer.tostring(decompressed)
-	return HttpService:JSONDecode(jsonString)
-end
-
--- Get the size of decompressed data without actually decompressing
-function CompressionHandler.getDecompressedSize(compressed: buffer): number?
-	return EncodingService:GetDecompressedBufferSize(compressed, PersonaStore.CompressionAlgorithm)
+-- Decompress a buffer back to a table. `algorithm` should be the SAME algorithm the
+-- buffer was originally compressed with (BUG FIX: this used to silently default to
+-- whatever PersonaStore.CompressionAlgorithm currently is, which breaks the moment
+-- SetCompressionSettings() is called and old profiles are read back).
+function CompressionHandler.decompress(compressed: buffer, algorithm: Enum.CompressionAlgorithm)
+	local decompressed = EncodingService:DecompressBuffer(compressed, algorithm)
+	return HttpService:JSONDecode(buffer.tostring(decompressed))
 end
 
 -- Encode buffer to base64 for safe storage in DataStore (JSON compatible)
@@ -143,14 +175,48 @@ function CompressionHandler.decodeFromBase64(str: string): buffer
 	return EncodingService:Base64Decode(buffer.fromstring(str))
 end
 
--- Compute hash of data for integrity verification
+-- Compute hash of data for integrity verification (BEFORE compression for consistency).
+-- BUG FIX: EncodingService:ComputeStringHash returns a raw hash digest, which is
+-- effectively random bytes -- NOT guaranteed to be valid UTF-8. DataHash and
+-- FieldHashes get written directly into the DataStore record, and Roblox
+-- DataStores reject any string that isn't valid UTF-8 with
+-- "CantStoreValue: Cannot store <...> in data store." on EVERY save that computes
+-- a hash. Base64-encoding the digest (the same trick already used for compressed
+-- buffer data below) guarantees the result is DataStore-safe ASCII.
 function CompressionHandler.hashData(data: string): string
-	return EncodingService:ComputeStringHash(data, PersonaStore.HashAlgorithm)
+	local rawHash = EncodingService:ComputeStringHash(data, PersonaStore.HashAlgorithm)
+	return CompressionHandler.encodeToBase64(buffer.fromstring(rawHash))
 end
 
--- Compute hash of buffer
+-- Compute hash of buffer. NOTE: returns a raw buffer, not a storage-safe string --
+-- if you ever persist this directly, base64-encode it first the same way
+-- hashData() does (see CompressionHandler.encodeToBase64).
 function CompressionHandler.hashBuffer(buf: buffer): buffer
 	return EncodingService:ComputeBufferHash(buf, PersonaStore.HashAlgorithm)
+end
+
+-- Given a raw stored profile record, decompress its Data in-place if needed, resolving
+-- the algorithm it was actually compressed with rather than assuming the current global.
+local function decompressRawIfNeeded(currentRaw)
+	if currentRaw.CompressionMetadata
+		and currentRaw.CompressionMetadata.IsCompressed
+		and currentRaw.CompressedData then
+
+		local decodedBuffer =
+			CompressionHandler.decodeFromBase64(currentRaw.CompressedData)
+
+		local algorithm =
+			resolveCompressionAlgorithm(
+				currentRaw.CompressionMetadata.Algorithm
+			)
+			or PersonaStore.CompressionAlgorithm
+
+		currentRaw.Data =
+			CompressionHandler.decompress(
+				decodedBuffer,
+				algorithm
+			)
+	end
 end
 
 -- Performs a deep memory clone of an associative or sequential tree to isolate templates
@@ -225,9 +291,10 @@ local function profileRaw(elapsed: number): table
 		SessionToken = nil,
 		JobId = nil,
 		LastUpdate = elapsed,
-		Version = 0,
+		Revision = 0,
 		GlobalUpdates = {},
-		DataHash = nil, -- For integrity verification
+		DataHash = nil, -- Hash computed BEFORE compression for consistency (Full / HashOnlyOnFullSave modes)
+		FieldHashes = {}, -- Per-field hashes (PerField mode)
 		CompressionMetadata = {
 			IsCompressed = false,
 			Algorithm = nil,
@@ -252,9 +319,11 @@ local function withRetry(attemptFn: () -> any, maxAttempts: number?): (boolean, 
 		lastError = result
 		PersonaStore._statistics.DatastoreRequestsFailed += 1
 
-		task.wait(
-			math.min(2 ^ attemptIndex, 16) + (math.random() * 0.5)
-		)
+		if attemptIndex < attempts then
+			task.wait(
+				math.min(2 ^ attemptIndex, 16) + (math.random() * 0.5)
+			)
+		end
 	end
 
 	return false, lastError
@@ -289,7 +358,7 @@ function DataSession.new<T>(key: string, rawData: table, token: string, parentSt
 	self._dirtyFields = {}
 	self._autoSaveThread = nil
 	self._pendingGlobalUpdates = {}
-	self._compressionCache = nil -- Cached compressed data
+	self._compressionCache = nil -- Cached compressed data (per-session, not global)
 
 	self.Data = createObservableTable(rawData.Data, function(mutatedKey, mutatedValue, rootKey)
 		self._metadata.LastModified = os.time()
@@ -350,12 +419,40 @@ function DataSession:Save(): boolean
 
 			currentRaw.Data = deepCopy(self.Data)
 			currentRaw.LastUpdate = os.time()
-			currentRaw.Version = (currentRaw.Version or 0) + 1
+			currentRaw.Revision = (currentRaw.Revision or 0) + 1
+			
+			-- Update metadata after a successful save
+			-- We actually DONT wanna increment this on patch save
+			-- Suppose another server somehow advanced it to 250,
+			-- +1 isn't necessarily correct.
+			self._metadata.SyncedRevision = currentRaw.Revision
 
-			-- Compute data hash for integrity verification
+			-- Full saves always recompute BOTH the whole-profile hash and the per-field
+			-- hash table, regardless of IntegrityMode, so PerField mode always has a
+			-- consistent baseline to diff patches against.
 			if PersonaStore.EnableDataIntegrityChecks then
 				currentRaw.DataHash = CompressionHandler.hashData(HttpService:JSONEncode(currentRaw.Data))
+
+				local hashes = {}
+
+				for fieldName, fieldValue in pairs(currentRaw.Data) do
+					hashes[fieldName] =
+						CompressionHandler.hashData(HttpService:JSONEncode(fieldValue))
+				end
+
+				currentRaw.FieldHashes = hashes
 			end
+
+			-- Clear compression metadata when doing uncompressed save
+			currentRaw.CompressionMetadata = {
+				IsCompressed = false,
+				Algorithm = nil,
+				OriginalSize = nil,
+				CompressedSize = nil,
+			}
+			
+			-- Also clear compressed data when doing uncompressed save
+			currentRaw.CompressedData = nil
 
 			return currentRaw
 		end)
@@ -374,11 +471,14 @@ function DataSession:Save(): boolean
 	end
 end
 
--- High-Efficiency Selective Data Patching with optional compression
-function DataSession:SavePatch(enableCompression: boolean?): boolean
+-- High-Efficiency Selective Data Patching
+-- Hashing cost now scales with IntegrityMode instead of always rehashing the whole profile:
+--   "Full"               -> rehashes everything on every patch (old behavior, expensive).
+--   "HashOnlyOnFullSave"  -> skips hashing entirely; DataHash only advances on Save().
+--   "PerField"            -> only rehashes the fields that were actually dirtied.
+function DataSession:SavePatch(): boolean
 	if self._isReleased then return false end
 
-	local shouldCompress = enableCompression ~= nil and enableCompression or false
 	local dirtyKeys = {}
 
 	for fieldName in pairs(self._dirtyFields) do
@@ -404,12 +504,37 @@ function DataSession:SavePatch(enableCompression: boolean?): boolean
 			end
 
 			currentRaw.LastUpdate = os.time()
-			currentRaw.Version = (currentRaw.Version or 0) + 1
+			currentRaw.Revision = (currentRaw.Revision or 0) + 1
 
-			-- Compute data hash for integrity verification
 			if PersonaStore.EnableDataIntegrityChecks then
-				currentRaw.DataHash = CompressionHandler.hashData(HttpService:JSONEncode(currentRaw.Data))
+				local mode = PersonaStore.IntegrityMode
+
+				if mode == "PerField" then
+					currentRaw.FieldHashes = currentRaw.FieldHashes or {}
+					for _, fieldName in ipairs(dirtyKeys) do
+						local fieldJson = HttpService:JSONEncode(exportedSnapshot[fieldName])
+						currentRaw.FieldHashes[fieldName] = CompressionHandler.hashData(fieldJson)
+					end
+					-- DataHash intentionally left stale here; PerField verification
+					-- reads FieldHashes instead of the whole-profile hash.
+				elseif mode == "HashOnlyOnFullSave" then
+					-- Deliberately skip all hashing on patch saves. DataHash/FieldHashes
+					-- only get refreshed the next time Save() runs a full write.
+				else -- "Full" (default/back-compat)
+					currentRaw.DataHash = CompressionHandler.hashData(HttpService:JSONEncode(currentRaw.Data))
+				end
 			end
+
+			-- Clear compression metadata on patch save
+			currentRaw.CompressionMetadata = {
+				IsCompressed = false,
+				Algorithm = nil,
+				OriginalSize = nil,
+				CompressedSize = nil,
+			}
+			
+			-- Also clear compression metadata on patch save
+			currentRaw.CompressedData = nil
 
 			return currentRaw
 		end)
@@ -428,7 +553,8 @@ function DataSession:SavePatch(enableCompression: boolean?): boolean
 	end
 end
 
--- NEW: Save with compression for large profiles
+-- Save with compression for large profiles
+-- Now actually stores compressed data and uses compression cache
 function DataSession:SaveCompressed(): boolean
 	if self._isReleased then return false end
 
@@ -439,25 +565,49 @@ function DataSession:SaveCompressed(): boolean
 			end
 
 			local dataToSave = deepCopy(self.Data)
-			local compressed = CompressionHandler.compress(dataToSave)
-			local encoded = CompressionHandler.encodeToBase64(compressed)
+			local jsonData = HttpService:JSONEncode(dataToSave)
+			local originalSize = #jsonData
 
-			currentRaw.Data = dataToSave -- Keep uncompressed for runtime access
-			currentRaw.CompressionMetadata = {
-				IsCompressed = true,
-				Algorithm = tostring(PersonaStore.CompressionAlgorithm),
-				OriginalSize = HttpService:JSONEncode(dataToSave):len(),
-				CompressedSize = encoded:len(),
-			}
-			currentRaw.LastUpdate = os.time()
-			currentRaw.Version = (currentRaw.Version or 0) + 1
-
+			-- Compute hash BEFORE compression for consistency
+			local dataHash = nil
 			if PersonaStore.EnableDataIntegrityChecks then
-				currentRaw.DataHash = CompressionHandler.hashData(encoded)
+				dataHash = CompressionHandler.hashData(jsonData)
 			end
 
-			self._metadata.CompressionStats.LastCompressedSize = encoded:len()
-			self._metadata.CompressionStats.LastUncompressedSize = dataToSave:len()
+			-- Use cached compression if available
+			local compressed
+			if self._compressionCache then
+				compressed = self._compressionCache
+			else
+				compressed = CompressionHandler.compress(dataToSave)
+				if PersonaStore.EnableCompressionCache then
+					self._compressionCache = compressed
+				end
+			end
+
+			local encoded = CompressionHandler.encodeToBase64(compressed)
+			local compressedSize = #encoded
+
+			-- Store metadata and compressed data
+			currentRaw.Data = nil  -- Clear uncompressed data
+			currentRaw.CompressedData = encoded  -- Store compressed data
+			currentRaw.CompressionMetadata = {
+				IsCompressed = true,
+				OriginalSize = originalSize,
+				CompressedSize = compressedSize,
+				Algorithm = tostring(PersonaStore.CompressionAlgorithm)
+			}
+			currentRaw.LastUpdate = os.time()
+			currentRaw.Revision = (currentRaw.Revision or 0) + 1
+
+			-- Store hash computed BEFORE compression
+			if PersonaStore.EnableDataIntegrityChecks then
+				currentRaw.DataHash = dataHash
+			end
+
+			-- Properly compute uncompressed size using JSON
+			self._metadata.CompressionStats.LastCompressedSize = compressedSize
+			self._metadata.CompressionStats.LastUncompressedSize = originalSize
 
 			return currentRaw
 		end)
@@ -467,7 +617,6 @@ function DataSession:SaveCompressed(): boolean
 		self._metadata.LastSaved = os.time()
 		self._metadata.WriteCycles += 1
 		self._dirtyFields = {}
-		self._compressionCache = nil
 		PersonaStore._statistics.TotalSaves += 1
 		return true
 	else
@@ -486,7 +635,10 @@ function DataSession:StartAutoSave(intervalSeconds: number)
 
 			if self._isReleased then break end
 
-			self:SavePatch()
+			-- To prevent firing every interval if nothing has changed
+			if next(self._dirtyFields) then
+				self:SavePatch()
+			end
 		end
 	end)
 end
@@ -509,13 +661,17 @@ function DataSession:IsCacheStale(): boolean
 		return false
 	end
 
-	local localVersion = self._metadata.SyncedVersion or 0
-	local remoteVersion = remoteRaw.Version or 0
+	local localVersion = self._metadata.SyncedRevision or 0
+	local remoteVersion = remoteRaw.Revision or 0
 
 	return remoteVersion > localVersion
 end
 
--- NEW: Verify data integrity using stored hash
+-- Verify data integrity using stored hash(es).
+-- BUG FIX: this used to hash the live observable proxy (self.Data) directly with
+-- HttpService:JSONEncode, which doesn't respect the proxy's __iter metamethod and
+-- therefore never matched the DataHash computed from deepCopy(self.Data) at save time.
+-- It now deep-copies first, exactly like every Save path does, and is IntegrityMode-aware.
 function DataSession:VerifyDataIntegrity(): boolean
 	if not PersonaStore.EnableDataIntegrityChecks then
 		return true
@@ -525,27 +681,61 @@ function DataSession:VerifyDataIntegrity(): boolean
 		return self._storeRef._storageInstance:GetAsync(self._key)
 	end, 3)
 
-	if not success or not remoteRaw or not remoteRaw.DataHash then
+	if not success or not remoteRaw then
 		return false
 	end
 
-	local currentHash = CompressionHandler.hashData(HttpService:JSONEncode(self.Data))
+	local snapshot = deepCopy(self.Data)
+
+	if PersonaStore.IntegrityMode == "PerField" then
+		if not remoteRaw.FieldHashes then
+			return false
+		end
+
+		for fieldName, fieldValue in pairs(snapshot) do
+			local expectedHash = remoteRaw.FieldHashes[fieldName]
+			if expectedHash then
+				local actualHash = CompressionHandler.hashData(HttpService:JSONEncode(fieldValue))
+				if actualHash ~= expectedHash then
+					return false
+				end
+			end
+		end
+
+		return true
+	end
+
+	-- "Full" and "HashOnlyOnFullSave" both rely on the whole-profile DataHash; the
+	-- difference between those two modes is only WHEN that hash gets refreshed.
+	if not remoteRaw.DataHash then
+		return false
+	end
+
+	local currentHash = CompressionHandler.hashData(HttpService:JSONEncode(snapshot))
 	return currentHash == remoteRaw.DataHash
 end
 
--- NEW: Atomically increment a counter in the data
+-- Atomically increment a counter with proper transaction handling
 function DataSession:IncrementCounter(fieldName: string, amount: number?): boolean
 	amount = amount or 1
 	if self._isReleased then return false end
 
 	self:BeginTransaction()
 	self.Data[fieldName] = (self.Data[fieldName] or 0) + amount
-	self:CommitTransaction()
 
-	return self:SavePatch()
+	-- Save first, then commit. If save fails, rollback.
+	local saveSuccess = self:SavePatch()
+
+	if saveSuccess then
+		self:CommitTransaction()
+		return true
+	else
+		self:RollbackTransaction()
+		return false
+	end
 end
 
--- NEW: Export profile data for backup/migration
+-- Export profile data for backup/migration
 function DataSession:ExportData(includeMetadata: boolean?): string
 	local export = {
 		Data = deepCopy(self.Data),
@@ -557,7 +747,7 @@ function DataSession:ExportData(includeMetadata: boolean?): string
 	return HttpService:JSONEncode(export)
 end
 
--- NEW: Import profile data from export (with validation)
+-- Import profile data from export (preserves observable proxy)
 function DataSession:ImportData(jsonString: string, overwrite: boolean?): boolean
 	if self._isReleased then return false end
 
@@ -572,8 +762,17 @@ function DataSession:ImportData(jsonString: string, overwrite: boolean?): boolea
 	self:BeginTransaction()
 
 	if overwrite then
-		self.Data = decoded.Data
+		-- Merge values instead of replacing proxy
+		for key in pairs(self.Data) do
+			self.Data[key] = nil
+		end
+		for key, value in pairs(decoded.Data) do
+			self.Data[key] = value
+		end
+
+		reconcileData(self.Data, self._storeRef._templateSchema)
 	else
+		-- Merge mode: merge without replacing proxy
 		for key, value in pairs(decoded.Data) do
 			self.Data[key] = value
 		end
@@ -616,19 +815,21 @@ function DataSession:Release()
 
 	self._storeRef._activeSessions[self._key] = nil
 
-	task.spawn(function()
-		withRetry(function()
-			self._storeRef._storageInstance:UpdateAsync(self._key, function(currentRaw)
-				if not currentRaw or currentRaw.SessionToken ~= self._token then return nil end
+	--// NOTE
+	--// You would usually want to make this asynchronous by wrapping
+	-- it in a task.spawn() call, but for simplicity we'll keep it
+	-- synchronous here. 
+	withRetry(function()
+		self._storeRef._storageInstance:UpdateAsync(self._key, function(currentRaw)
+			if not currentRaw or currentRaw.SessionToken ~= self._token then return nil end
 
-				currentRaw.SessionToken = nil
-				currentRaw.JobId = nil
-				currentRaw.LastUpdate = os.time()
+			currentRaw.SessionToken = nil
+			currentRaw.JobId = nil
+			currentRaw.LastUpdate = os.time()
 
-				return currentRaw
-			end)
-		end, 3)
-	end)
+			return currentRaw
+		end)
+	end, 3)
 end
 
 -- Convenience alias: a full teardown that always saves first
@@ -657,14 +858,13 @@ function Founder.new<T>(storeName: string, configOptions: table): Founder<T>
 	self._storageInstance = DataStoreService:GetDataStore(storeName)
 	self._activeSessions = {}
 	self._templateSchema = self._config.Schema or {}
-	self._readOnlyCache = {} -- For read-only access
 
 	PersonaStore.RegisteredStores[storeName] = self
 
 	return self
 end
 
--- Main interface handler to acquire, reconcile, and lock user profiles safely
+-- Main interface handler now supports decompression on load
 function Founder:LoadSession<T>(key: string): DataSession<T>
 	if self._activeSessions[key] then
 		return self._activeSessions[key]
@@ -679,12 +879,12 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 	local currentJobId = game.JobId ~= "" and game.JobId or "StudioInstance"
 	local activeSessionObject = nil
 
-	MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
+	withRetry(MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
 		Action = "Eject_Key",
 		TargetStore = self._storeName,
 		TargetKey = key,
 		OriginJobId = currentJobId,
-	})
+	}))
 
 	local success, err = withRetry(function()
 		self._storageInstance:UpdateAsync(key, function(currentRaw)
@@ -700,6 +900,10 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 			else
 				currentRaw = profileRaw(currentTime)
 			end
+
+			-- Decompress data if it was stored compressed (uses the algorithm it was
+			-- actually compressed with, resolved from CompressionMetadata.Algorithm).
+			decompressRawIfNeeded(currentRaw)
 
 			currentRaw.SessionToken = uniqueToken
 			currentRaw.JobId = currentJobId
@@ -719,7 +923,7 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 	end
 
 	local newSession = DataSession.new(key, activeSessionObject, uniqueToken, self)
-	newSession._metadata.SyncedVersion = activeSessionObject.Version or 0
+	newSession._metadata.SyncedRevision = activeSessionObject.Revision or 0
 
 	self._activeSessions[key] = newSession
 
@@ -748,8 +952,8 @@ function Founder:LoadSessionAsync<T>(key: string, maxWaitSeconds: number?): Data
 	return nil
 end
 
--- NEW: Load profile as read-only without acquiring a lock
-function Founder:LoadReadOnlySession<T>(key: string): table?
+-- Load profile as read-only without acquiring a lock (returns deep copy)
+function Founder:LoadReadOnlySnapshot<T>(key: string): table?
 	local success, data = withRetry(function()
 		return self._storageInstance:GetAsync(key)
 	end, 3)
@@ -758,7 +962,15 @@ function Founder:LoadReadOnlySession<T>(key: string): table?
 		return nil
 	end
 
+	-- Decompress if needed before returning snapshot
+	decompressRawIfNeeded(data)
+
 	return deepCopy(data)
+end
+
+-- Alias for backwards compatibility
+function Founder:LoadReadOnlySession<T>(key: string): table?
+	return self:LoadReadOnlySnapshot(key)
 end
 
 -- Feature: Live Cross-Server Global Updates
@@ -781,43 +993,45 @@ function Founder:PublishGlobalUpdate(key: string, payload: table): boolean
 		end)
 	end)
 
-	MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
+	withRetry(MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
 		Action = "Global_Update",
 		TargetStore = self._storeName,
 		TargetKey = key,
 		Payload = payload,
-	})
+	}))
 
 	return (success == true)
 end
 
 -- Forcibly requests eviction of a key without loading it yourself
 function Founder:ForceEjectKey(key: string)
-	MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
+	withRetry(MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
 		Action = "Eject_Key",
 		TargetStore = self._storeName,
 		TargetKey = key,
 		OriginJobId = game.JobId ~= "" and game.JobId or "StudioInstance",
-	})
+	}))
 end
 
--- NEW: Batch operation to update multiple keys with a transformation function
-function Founder:BatchUpdate(keys: {string}, transformFn: (data: table) -> table): {[string]: boolean}
+-- Batch operation with improved cleanup
+-- BUG FIX: this previously called session:SavePatch() and then session:Destroy()
+-- (which itself calls Save(), a full write) back to back -- every key in the batch
+-- was written to the DataStore twice. Destroy() already saves; the extra SavePatch()
+-- is removed.
+function Founder:BatchUpdate(keys: {string}, transformFn: (data: table) -> ()): {[string]: boolean}
 	local results = {}
 
 	for _, key in ipairs(keys) do
 		local session = self:LoadSessionAsync(key, 5)
 		if session then
-			local success = pcall(function()
+			local transformSuccess = pcall(function()
 				transformFn(session.Data)
 			end)
 
-			if success then
-				session:SavePatch()
-			end
-
-			session:Release()
-			results[key] = success
+			-- Destroy() performs a full Save() (which captures all fields, transformed
+			-- or not) and then releases the lock. Do not also SavePatch() here.
+			session:Destroy()
+			results[key] = transformSuccess
 		else
 			results[key] = false
 		end
@@ -826,7 +1040,7 @@ function Founder:BatchUpdate(keys: {string}, transformFn: (data: table) -> table
 	return results
 end
 
--- NEW: Read profile statistics and metadata
+-- Read profile statistics and metadata
 function Founder:GetKeyMetadata(key: string): table?
 	local success, data = withRetry(function()
 		return self._storageInstance:GetAsync(key)
@@ -837,12 +1051,17 @@ function Founder:GetKeyMetadata(key: string): table?
 	end
 
 	return {
-		Version = data.Version,
+		Revision = data.Revision,
 		LastUpdate = data.LastUpdate,
 		SessionToken = data.SessionToken,
 		JobId = data.JobId,
-		DataHash = data.DataHash,
-		CompressionMetadata = data.CompressionMetadata,
+
+		Integrity = {
+			DataHash = data.DataHash,
+			FieldHashes = data.FieldHashes,
+		},
+
+		Compression = data.CompressionMetadata,
 	}
 end
 
@@ -857,13 +1076,278 @@ function Founder:GetActiveSessionCount(): number
 	return count
 end
 
--- NEW: Get compression statistics for this store
-function Founder:GetCompressionStats(): table
-	return {
-		TotalCompressions = PersonaStore._statistics.TotalCompressions,
-		TotalDecompressions = PersonaStore._statistics.TotalDecompressions,
-		BytesSavedByCompression = PersonaStore._statistics.BytesSavedByCompression,
-	}
+--// DataStore Version APIs
+-- Thin, retry-wrapped interfaces over the native DataStore versioning API.
+
+-- Lists historical versions of a key. Returns the native DataStoreVersionPages object
+-- (call :GetCurrentPage() / :AdvanceToNextPageAsync() on it as usual), or nil on failure.
+function Founder:ListVersionsAsync(key: string, sortDirection: Enum.SortDirection?, minDate: number?, maxDate: number?, pageSize: number?)
+	local success, pages = withRetry(function()
+		return self._storageInstance:ListVersionsAsync(
+			key,
+			sortDirection or Enum.SortDirection.Descending,
+			minDate,
+			maxDate,
+			pageSize or 50
+		)
+	end, 3)
+
+	if not success then
+		warn("[Founder]: ListVersionsAsync failed for key: " .. key .. " -> " .. tostring(pages))
+		return nil
+	end
+
+	return pages
+end
+
+-- Fetches a specific historical version of a key's raw record, decompressing its
+-- Data automatically if that version happened to be stored compressed.
+function Founder:GetVersionAsync(key: string, version: string): table?
+	local success, data = withRetry(function()
+		return self._storageInstance:GetVersionAsync(key, version)
+	end, 3)
+
+	if not success or not data then
+		warn("[Founder]: GetVersionAsync failed for key: " .. key .. " version: " .. tostring(version) .. " -> " .. tostring(data))
+		return nil
+	end
+
+	decompressRawIfNeeded(data)
+
+	return deepCopy(data)
+end
+
+-- Permanently removes a specific historical version of a key. This cannot be undone.
+function Founder:RemoveVersionAsync(key: string, version: string): boolean
+	local success, err = withRetry(function()
+		self._storageInstance:RemoveVersionAsync(key, version)
+		return true
+	end, 3)
+
+	if not success then
+		warn("[Founder]: RemoveVersionAsync failed for key: " .. key .. " version: " .. tostring(version) .. " -> " .. tostring(err))
+	end
+
+	return success == true
+end
+
+--// Class OrderedFounder
+-- A thin, retry-wrapped interface over GetOrderedDataStore, intended for leaderboards
+-- and other strictly-numeric sorted keys. Kept separate from Founder since
+-- OrderedDataStores only accept non-negative integer values, and have no concept of
+-- session locks, structured schemas, or compression.
+
+local OrderedFounder = {}
+OrderedFounder.__index = OrderedFounder
+
+function OrderedFounder.new<T>(storeName: string): OrderedFounder<T>
+	local self = setmetatable({}, OrderedFounder)
+
+	self._storeName = storeName
+	self._storageInstance = DataStoreService:GetOrderedDataStore(storeName)
+
+	PersonaStore.RegisteredOrderedStores[storeName] = self
+
+	return self
+end
+
+-- Sets a key to an explicit non-negative integer value
+function OrderedFounder:Set(key: string, value: number): boolean
+	if type(value) ~= "number" or value < 0 or value % 1 ~= 0 then
+		warn("[OrderedFounder]: value must be a non-negative integer for key: " .. key)
+		return false
+	end
+
+	local success = withRetry(function()
+		self._storageInstance:SetAsync(key, value)
+		return true
+	end)
+
+	return success == true
+end
+
+-- Reads the current value for a key, or nil if it doesn't exist
+function OrderedFounder:Get(key: string): number?
+	local success, value = withRetry(function()
+		return self._storageInstance:GetAsync(key)
+	end, 3)
+
+	if not success then
+		return nil
+	end
+
+	return value
+end
+
+-- Atomically increments (or decrements, with a negative delta) a key's value
+function OrderedFounder:Increment(key: string, delta: number?): number?
+	local success, result = withRetry(function()
+		return self._storageInstance:IncrementAsync(key, delta or 1)
+	end)
+
+	if not success then
+		return nil
+	end
+
+	return result
+end
+
+-- Removes a key entirely
+function OrderedFounder:Remove(key: string): boolean
+	local success = withRetry(function()
+		self._storageInstance:RemoveAsync(key)
+		return true
+	end, 3)
+
+	return success == true
+end
+
+-- Fetches one sorted page of entries. Returns the current page ({key, value} entries)
+-- plus the raw DataStorePages object (for pagination via :AdvanceToNextPageAsync()).
+function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, minValue: number?, maxValue: number?)
+	local success, pages = withRetry(function()
+		return self._storageInstance:GetSortedAsync(ascending or false, pageSize or 50, minValue, maxValue)
+	end, 3)
+
+	if not success then
+		warn("[OrderedFounder]: GetSortedAsync failed for store: " .. self._storeName .. " -> " .. tostring(pages))
+		return nil, nil
+	end
+
+	local currentPage = pages:GetCurrentPage()
+	return currentPage, pages
+end
+
+--// Class MemoryQueueWrapper
+-- Retry-wrapped interface over a MemoryStoreService queue. Intended for short-lived,
+-- high-throughput, ephemeral job/event data -- NOT for anything that needs the
+-- durability guarantees of a DataStore.
+
+local MemoryQueueWrapper = {}
+MemoryQueueWrapper.__index = MemoryQueueWrapper
+
+function MemoryQueueWrapper.new(name: string): MemoryQueueWrapper
+	local self = setmetatable({}, MemoryQueueWrapper)
+
+	self._name = name
+	self._queue = MemoryStoreService:GetQueue(name)
+
+	PersonaStore.RegisteredMemoryQueues[name] = self
+
+	return self
+end
+
+-- Adds an item to the queue. expirationSeconds defaults to 1 hour.
+function MemoryQueueWrapper:AddItem(value: any, expirationSeconds: number?, priority: number?): boolean
+	local success = withRetry(function()
+		self._queue:AddAsync(value, expirationSeconds or 3600, priority)
+		return true
+	end, 3)
+
+	return success == true
+end
+
+-- Reads up to `count` items. Returns (items, receiptId) so the caller can later
+-- RemoveItem(receiptId) once the items have been successfully processed.
+function MemoryQueueWrapper:ReadItems(count: number?, allOrNothing: boolean?, waitTimeoutSeconds: number?): ({any}?, string?)
+	local success, result = withRetry(function()
+		local items, receiptId = self._queue:ReadAsync(count or 1, allOrNothing or false, waitTimeoutSeconds or 5)
+		return { Items = items, ReceiptId = receiptId }
+	end, 3)
+
+	if not success or not result then
+		return nil, nil
+	end
+
+	return result.Items, result.ReceiptId
+end
+
+-- Removes a previously-read batch of items using the receiptId from ReadItems
+function MemoryQueueWrapper:RemoveItems(receiptId: string): boolean
+	local success = withRetry(function()
+		self._queue:RemoveAsync(receiptId)
+		return true
+	end, 3)
+
+	return success == true
+end
+
+--// Class MemorySortedMapWrapper
+-- Retry-wrapped interface over a MemoryStoreService sorted map. Useful for
+-- fast-changing leaderboard-style data that doesn't need DataStore durability, or as
+-- a scratch layer in front of a real DataStore write.
+
+local MemorySortedMapWrapper = {}
+MemorySortedMapWrapper.__index = MemorySortedMapWrapper
+
+function MemorySortedMapWrapper.new(name: string): MemorySortedMapWrapper
+	local self = setmetatable({}, MemorySortedMapWrapper)
+
+	self._name = name
+	self._map = MemoryStoreService:GetSortedMap(name)
+
+	PersonaStore.RegisteredMemorySortedMaps[name] = self
+
+	return self
+end
+
+-- Sets a key's value. expirationSeconds defaults to 1 hour.
+function MemorySortedMapWrapper:Set(key: string, value: any, expirationSeconds: number?, sortKey: any?): boolean
+	local success = withRetry(function()
+		self._map:SetAsync(key, value, expirationSeconds or 3600, sortKey)
+		return true
+	end, 3)
+
+	return success == true
+end
+
+-- Gets a key's value, or nil if it doesn't exist / has expired
+function MemorySortedMapWrapper:Get(key: string): any?
+	local success, value = withRetry(function()
+		return self._map:GetAsync(key)
+	end, 3)
+
+	if not success then
+		return nil
+	end
+
+	return value
+end
+
+-- Removes a key
+function MemorySortedMapWrapper:Remove(key: string): boolean
+	local success = withRetry(function()
+		self._map:RemoveAsync(key)
+		return true
+	end, 3)
+
+	return success == true
+end
+
+-- Returns a sorted range of {key, value, sortKey} entries
+function MemorySortedMapWrapper:GetRange(direction: Enum.SortDirection?, count: number?, exclusiveLowerBound: any?, exclusiveUpperBound: any?): {table}
+	local success, items = withRetry(function()
+		return self._map:GetRangeAsync(direction or Enum.SortDirection.Ascending, count or 50, exclusiveLowerBound, exclusiveUpperBound)
+	end, 3)
+
+	if not success then
+		return {}
+	end
+
+	return items
+end
+
+-- Atomically transforms a key's value via `transformFn(oldValue) -> newValue`
+function MemorySortedMapWrapper:Update(key: string, transformFn: (oldValue: any) -> any, expirationSeconds: number?): any?
+	local success, result = withRetry(function()
+		return self._map:UpdateAsync(key, transformFn, expirationSeconds or 3600)
+	end, 3)
+
+	if not success then
+		return nil
+	end
+
+	return result
 end
 
 -- Creates the engine singleton
@@ -878,6 +1362,33 @@ function PersonaStore:CreateDataStore<T>(storeName: string, configOptions: table
 	end
 
 	return Founder.new(storeName, configOptions) :: T
+end
+
+-- Registers and returns a new isolated OrderedFounder
+function PersonaStore:CreateOrderedDataStore<T>(storeName: string): OrderedFounder<T>
+	if self.RegisteredOrderedStores[storeName] then
+		return self.RegisteredOrderedStores[storeName] :: T
+	end
+
+	return OrderedFounder.new(storeName) :: T
+end
+
+-- Registers and returns a new MemoryQueueWrapper
+function PersonaStore:CreateMemoryQueue(name: string): MemoryQueueWrapper
+	if self.RegisteredMemoryQueues[name] then
+		return self.RegisteredMemoryQueues[name]
+	end
+
+	return MemoryQueueWrapper.new(name)
+end
+
+-- Registers and returns a new MemorySortedMapWrapper
+function PersonaStore:CreateMemorySortedMap(name: string): MemorySortedMapWrapper
+	if self.RegisteredMemorySortedMaps[name] then
+		return self.RegisteredMemorySortedMaps[name]
+	end
+
+	return MemorySortedMapWrapper.new(name)
 end
 
 -- Boots the shared MessagingService subscription and the BindToClose drain
@@ -938,33 +1449,67 @@ function PersonaStore:Init()
 			task.wait(2)
 		end)
 	end
+	
+	print("[PersonaStore]: Engine started successfully!")
 end
 
--- NEW: Get engine-wide statistics
+-- Get engine-wide statistics
 function PersonaStore:GetStatistics(): table
 	return deepCopy(PersonaStore._statistics)
 end
 
--- NEW: Configure compression settings
+-- Configure compression settings
 function PersonaStore:SetCompressionSettings(algorithm: any, level: number)
 	PersonaStore.CompressionAlgorithm = algorithm or PersonaStore.CompressionAlgorithm
 	PersonaStore.CompressionLevel = math.clamp(level or PersonaStore.CompressionLevel, 1, 22)
 end
 
--- Client require guard
-task.spawn(function()
+-- Configure how expensive integrity hashing is on SavePatch(). See the IntegrityMode
+-- comment near the top of this file for the tradeoffs of each mode.
+function PersonaStore:SetIntegrityMode(mode: string)
+	if mode ~= "Full" and mode ~= "HashOnlyOnFullSave" and mode ~= "PerField" then
+		warn("[PersonaStore]: Unknown IntegrityMode '" .. tostring(mode) .. "'; expected 'Full', 'HashOnlyOnFullSave', or 'PerField'. Ignoring.")
+		return
+	end
+
+	PersonaStore.IntegrityMode = mode
+end
+
+-- Client require guard.
+-- BUG FIX: this used to be `withRetry(task.spawn(function() ... end))`, which passes a
+-- THREAD (the return value of task.spawn) into withRetry. withRetry then does
+-- `pcall(attemptFn)` on that thread, which is not callable, so pcall fails immediately
+-- on every one of its 5 attempts (burning through exponential backoff) before finally
+-- surfacing the WRONG error entirely. Fixed to call withRetry with an actual function,
+-- and to use maxAttempts = 1 since "are we on the server" is not a transient condition
+-- worth retrying/backing off on.
+local guardSuccess, guardErr = withRetry(function()
 	if not RunService:IsServer() then
 		error("PersonaStore can only be required from the server")
 	end
+	return true
+end, 1)
 
-	return {}
-end)
+if not guardSuccess then
+	error("[PersonaStore]: " .. tostring(guardErr))
+end
 
 --// Final Exports for autocomplete
+export type MemoryQueueWrapper = typeof(MemoryQueueWrapper)
+export type MemorySortedMapWrapper = typeof(MemorySortedMapWrapper)
+
 export type Founder<T> = typeof(Founder) & {
 	LoadSession: (self: Founder<T>, key: string) -> DataSession<T>,
 	LoadSessionAsync: (self: Founder<T>, key: string, maxWaitSeconds: number?) -> DataSession<T>?,
+	LoadReadOnlySnapshot: (self: Founder<T>, key: string) -> table?,
 	LoadReadOnlySession: (self: Founder<T>, key: string) -> table?,
+}
+
+export type OrderedFounder<T> = typeof(OrderedFounder) & {
+	Set: (self: OrderedFounder<T>, key: string, value: number) -> boolean,
+	Get: (self: OrderedFounder<T>, key: string) -> number?,
+	Increment: (self: OrderedFounder<T>, key: string, delta: number?) -> number?,
+	Remove: (self: OrderedFounder<T>, key: string) -> boolean,
 }
 
 export type Session<T> = {
@@ -972,7 +1517,7 @@ export type Session<T> = {
 	SessionToken: string?,
 	JobId: string?,
 	LastUpdate: number,
-	Version: number,
+	Revision: number,
 	GlobalUpdates: table,
 }
 
