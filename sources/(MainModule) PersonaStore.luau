@@ -938,11 +938,11 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 end
 
 -- Queued variant of LoadSession for cases where you'd rather wait for a lock to free up
-function Founder:LoadSessionAsync<T>(key: string, maxWaitSeconds: number?): DataSession<T>?
+function Founder:LoadSessionAsync<T>(key: string, maxWaitSeconds: number?): DataSession<T>
 	local deadline = os.clock() + (maxWaitSeconds or 10)
 
 	while os.clock() < deadline do
-		local session = self:LoadSession(key)
+		local session = self:LoadSession(key) :: DataSession<T>
 		if session then
 			return session
 		end
@@ -1504,11 +1504,18 @@ end
 export type MemoryQueueWrapper = typeof(MemoryQueueWrapper)
 export type MemorySortedMapWrapper = typeof(MemorySortedMapWrapper)
 
-export type Founder<T> = typeof(Founder) & {
-	LoadSession: (self: Founder<T>, key: string) -> DataSession<T>,
+export type Founder<T> = {
+	_storeName: string,
+	_config: table,
+	_storageInstance: DataStore,
+	_activeSessions: {[string]: DataSession<T>},
+	_templateSchema: T,
+
+	LoadSession: (self: Founder<T>, key: string) -> DataSession<T>?,
 	LoadSessionAsync: (self: Founder<T>, key: string, maxWaitSeconds: number?) -> DataSession<T>?,
 	LoadReadOnlySnapshot: (self: Founder<T>, key: string) -> table?,
 	LoadReadOnlySession: (self: Founder<T>, key: string) -> table?,
+	ForceEjectKey: (self: Founder<T>, key: string) -> (),
 }
 
 export type OrderedFounder<T> = typeof(OrderedFounder) & {
