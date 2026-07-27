@@ -53,6 +53,6 @@
 > No. PersonaStore is a **server-only** persistence framework and will throw an error if required from the client.
 > If you wanted to access data, you could follow this tutorial.
 
-> <img width="488" height="240" alt="image" src="https://github.com/user-attachments/assets/fc563630-df5d-4592-aa87-87d5a349d94e" />
+> https://www.youtube.com/watch?v=DpHYClnnYng&t=191s&pp=ygUpYmVzdCB3YXkgdG8gcmVhZCBkYXRhc3RvcmVzIG9uIHRoZSBjbGllbnQ%3D
 
 ---
