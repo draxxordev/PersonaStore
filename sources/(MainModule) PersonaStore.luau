@@ -271,6 +271,7 @@ local function createObservableTable(rawTable: table, changeCallback: (key: stri
 
 			if type(newValue) == "table" then
 				internalShadow[key] = createObservableTable(newValue, changeCallback, effectiveRoot)
+				
 			else
 				internalShadow[key] = newValue
 			end
@@ -1204,7 +1205,12 @@ end
 
 -- Fetches one sorted page of entries. Returns the current page ({key, value} entries)
 -- plus the raw DataStorePages object (for pagination via :AdvanceToNextPageAsync()).
-function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, minValue: number?, maxValue: number?)
+function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, minValue: number?, maxValue: number?): DataStorePages?
+	if pageSize and (pageSize < 1 or pageSize > 100) then
+		warn("[OrderedFounder]: pageSize must be between 1 and 100 for store: " .. self._storeName)
+		return nil, nil
+	end
+	
 	local success, pages = withRetry(function()
 		return self._storageInstance:GetSortedAsync(ascending or false, pageSize or 50, minValue, maxValue)
 	end, 3)
