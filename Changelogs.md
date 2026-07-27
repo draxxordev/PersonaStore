@@ -75,7 +75,7 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 > Example Test
 > Make a Script in ServerScriptService, place PersonaStore under it, then copy/paste this code.
 > ```lua
->-- Manual/integration test harness for PersonaStore.
+-- Manual/integration test harness for PersonaStore.
 -- Run in Studio with "Enable Studio Access to API Services" turned on, against a
 -- throwaway/staging place. Every store/key is suffixed with a run ID so repeated
 -- runs don't collide with leftover data.
