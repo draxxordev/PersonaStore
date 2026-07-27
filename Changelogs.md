@@ -6,9 +6,9 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 ---
 
 # v1.1.0
-*EncodingService Integration & Advanced Features*
 
 ## Added
+*EncodingService Integration & Advanced Features*
 
 ### Core Compression Features
 - Native Roblox `EncodingService` integration for efficient data compression.
@@ -98,56 +98,6 @@ session:SavePatch()
 session:SaveCompressed()  -- New compression
 session:VerifyDataIntegrity()  -- New integrity check
 ```
-
----
-
-# v1.0.0
-*Initial Release*
-
-## Added
-- Initial PersonaStore engine.
-- OOP architecture consisting of `PersonaStore`, `Founder`, and `DataSession`.
-- Session locking with automatic ownership validation.
-- Automatic schema reconciliation.
-- Deep observable proxy tree for nested table change detection.
-- Automatic patch-based autosaving.
-- Full profile saves via `Save()`.
-- Selective patch saves via `SavePatch()`.
-- Transaction system with rollback support.
-  - `BeginTransaction()` for snapshot creation.
-  - `CommitTransaction()` to finalize changes.
-  - `RollbackTransaction()` to revert to snapshot.
-- Cross-server global update system.
-- Offline global update queue.
-- MessagingService cluster synchronization.
-- Runtime performance metadata via `GetPerformanceMetadata()`.
-- Cache freshness verification via `IsCacheStale()`.
-- Exponential retry layer with randomized backoff.
-- Automatic BindToClose session draining.
-- Multiple isolated DataStore support via `CreateDataStore()`.
-- Event listeners:
-  - `ListenToFieldChange()` for data mutations.
-  - `ListenToGlobalUpdate()` for cluster updates.
-- Session lifecycle:
-  - `LoadSession()` for immediate acquire.
-  - `LoadSessionAsync()` for wait-based acquire.
-  - `Release()` for manual cleanup.
-  - `Destroy()` for save and cleanup.
-
----
-
-## Changed
-- N/A
-
----
-
-## Fixed
-- N/A
-
----
-
-## Removed
-- N/A
 
 ---
 
