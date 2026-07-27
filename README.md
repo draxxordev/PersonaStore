@@ -201,8 +201,8 @@ so developers can spend more time building games rather than persistence infrast
 
 PersonaStore is built with time, effort, love, and passion.
 
-**Author:** @DraxxorDev  
-**Version:** 1.1.0  
+**Author:** @Draxxor
+**Version:** 1.2.0
 **License:** MIT
 
 Made for developers by a developer. ❤
