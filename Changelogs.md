@@ -28,9 +28,6 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 - Exponential retry layer with randomized backoff.
 - Automatic BindToClose session draining.
 - Multiple isolated DataStore support.
-- Full API documentation.
-- FAQ section.
-- Examples and Getting Started guide.
 
 ---
 
