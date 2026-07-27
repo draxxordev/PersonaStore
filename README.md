@@ -6,18 +6,18 @@
 
 ## Features
 
-- 🔒 Session locking with automatic ownership validation
-- 💾 Automatic periodic patch saves
-- ⚡ Selective data patching (only changed fields are written)
-- 🌳 Deep observable proxy tree for nested table tracking
-- 🔄 Cross-server global update system
-- 📡 MessagingService-powered cluster synchronization
-- 🛡️ Transaction support with rollback protection
-- 🔍 Automatic schema reconciliation
-- 🚀 Retry layer with exponential backoff + jitter
-- 📊 Runtime metadata & diagnostics
-- 🧹 Automatic BindToClose cleanup
-- 📦 Multiple isolated DataStores through Founder objects
+-  Session locking with automatic ownership validation
+-  Automatic periodic patch saves
+-  Selective data patching (only changed fields are written)
+-  Deep observable proxy tree for nested table tracking
+-  Cross-server global update system
+-  MessagingService-powered cluster synchronization
+-  Transaction support with rollback protection
+-  Automatic schema reconciliation
+-  Retry layer with exponential backoff + jitter
+-  Runtime metadata & diagnostics
+-  Automatic BindToClose cleanup
+-  Multiple isolated DataStores through Founder objects
 
 ---
 
@@ -106,24 +106,27 @@ PersonaStore is composed of three primary objects.
 
 # Documentation
 
-- 📖 Getting Started
-- 📦 Creating DataStores
-- 💾 Loading Sessions
-- ✏️ Reading & Writing Data
-- 💾 Saving
-- 🔄 Transactions
-- 🌍 Global Updates
-- 📡 Change Listeners
-- 📊 Metadata
-- 🧹 Cleanup
-- ❓ FAQ
-- 📝 Changelog
+-  Getting Started
+-  Creating DataStores
+-  Loading Sessions
+-  Reading & Writing Data
+-  Saving
+-  Transactions
+-  Global Updates
+-  Change Listeners
+-  Metadata
+-  Cleanup
+-  FAQ
+-  Changelog
 
 ---
 
 # Example
 
 ```lua
+local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
+
 local PersonaStore = require(ServerStorage.PersonaStore)
 
 PersonaStore:Init()
@@ -135,7 +138,7 @@ local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
     }
 })
 
-game.Players.PlayerAdded:Connect(function(player)
+Players.PlayerAdded:Connect(function(player)
 
     local session = PlayerStore:LoadSession(tostring(player.UserId))
 
