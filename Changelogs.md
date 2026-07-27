@@ -87,7 +87,7 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 - N/A
 
 ### Migration Notes for v1.0.0 → v1.1.0
-✅ **100% Backward Compatible** - No breaking changes. Existing code continues to work without modification.
+**100% Backward Compatible** - No breaking changes. Existing code continues to work without modification.
 
 New features are opt-in and can be adopted gradually:
 ```lua
