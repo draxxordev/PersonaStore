@@ -198,7 +198,7 @@ so developers can spend more time building games rather than persistence infrast
 
 # License
 
-#MIT License
+# [MIT License]
 
 Open-source for the Roblox Development community.
 
