@@ -42,7 +42,7 @@ Configure compression settings globally:
 
 ```lua
 -- Use ZSTD compression (better ratio, slower) with level 9
-PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 9)
+PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.Zstd, 9)
 ```
 
 Configure how much a `SavePatch()` hash pass costs (see [Integrity Modes](#integrity-modes) below):
@@ -113,12 +113,12 @@ local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
 Configures compression algorithm and level for all future compression operations.
 
 ```lua
-PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 9)
+PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.Ztsd, 9)
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `algorithm` | `Enum.CompressionAlgorithm` | `ZSTD (only method as of now)` |
+| `algorithm` | `Enum.CompressionAlgorithm` | `Zstd (only method as of now)` |
 | `level` | `number` | 1-22 depending on algorithm (1=faster, 22=better compression) |
 
 **Recommendations:**
@@ -765,7 +765,7 @@ When `PersonaStore.EnableDataIntegrityChecks = true` (default):
 
 **Hash Algorithms Supported:**
 
-- `SHA256` (default, recommended)
+- `Sha256` (default, recommended)
 - `SHA1` (faster, less secure)
 - `MD5` (fastest, not recommended for security-critical data)
 
@@ -1099,7 +1099,7 @@ session:StartAutoSave(15)
 local PersonaStore = require(ServerStorage.PersonaStore)
 
 -- Configure engine
-PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 6)
+PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.Zstd, 6)
 PersonaStore:SetIntegrityMode("PerField")
 PersonaStore:Init()
 
@@ -1169,10 +1169,10 @@ end
 ### PersonaStore Settings
 
 ```lua
-PersonaStore.CompressionAlgorithm = Enum.CompressionAlgorithm.Deflate
+PersonaStore.CompressionAlgorithm = Enum.CompressionAlgorithm.Zstd
 PersonaStore.CompressionLevel = 6
 PersonaStore.EnableDataIntegrityChecks = true
-PersonaStore.HashAlgorithm = Enum.HashAlgorithm.SHA256
+PersonaStore.HashAlgorithm = Enum.HashAlgorithm.Sha256
 PersonaStore.IntegrityMode = "Full" -- "Full" | "HashOnlyOnFullSave" | "PerField"
 PersonaStore.GlobalLockTimeout = 120  -- seconds
 PersonaStore.GlobalAutoSaveInterval = 30  -- seconds
