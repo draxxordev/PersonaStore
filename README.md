@@ -108,69 +108,121 @@ PersonaStore is composed of three primary objects.
 
 > Without Generic Types (No AutoComplete)
 ```lua
-local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 
-local PersonaStore = require(ServerStorage.PersonaStore)
+local PersonaStore = require(ReplicatedStorage.Packages.PersonaStore)
 PersonaStore:Init()
 
-local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
-    Schema = {
-        Coins = 0,
-        Inventory = {}
-    }
+local Template = {
+	Money = 0,
+	Kills = 0,
+}
+
+local MoneyStore = PersonaStore:CreateDataStore("MoneyStats_v1", {
+	Schema = Template
 })
 
+local sessions = {}
+
 Players.PlayerAdded:Connect(function(player)
-    local session = PlayerStore:LoadSession(tostring(player.UserId))
+	local session = MoneyStore:LoadSessionAsync(tostring(player.UserId), 10)
+	if not session then
+		player:Kick("Failed to load session your session. Please rejoin.")
+		return
+	end
+	
+    local leaderstats = Instance.new("Folder", player)
+	leaderstats.Name = "leaderstats"
+	
+    local money = Instance.new("IntValue", leaderstats)
+    money.Name = "Money"
+	money.Value = session.Data.Money
+	
+    local kills = Instance.new("IntValue", leaderstats)
+    kills.Name = "Kills"
+	kills.Value = session.Data.Kills
+	
+	session[player.UserId] = session
+	
+	session:ListenToFieldChange(function(_, new, root)
+		if root == "Kills" then
+			kills.Value = new
+		end
+		
+		if root == "Money" then
+			money.Value = new
+		end
+	end)
+end)
 
-    if not session then
-        player:Kick("Unable to load your profile.")
-        return
-    end
-
-    session.Data.Coins += 500
-
-    player.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            session:Destroy()
-        end
-    end)
+Players.PlayerRemoving:Connect(function(player)
+	local session = sessions[player.UserId]
+	if session then
+		session:Destroy()
+	end
+	
+	sessions[player.UserId] = nil
 end)
 ```
 
 > With Generic Types (AutoComplete For Data)
 ```lua
-local ServerStorage = game:GetService("ServerStorage")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 
-local PersonaStore = require(ServerStorage.PersonaStore)
+local PersonaStore = require(ReplicatedStorage.Packages.PersonaStore)
 PersonaStore:Init()
 
-local DataTemplate = {
-    Coins = 0,
-    Inventory = {}
+local Template = {
+	Money = 0,
+	Kills = 0,
 }
 
-local PlayerStore: PersonaStore.Founder<typeof(DataTemplate)> = PersonaStore:CreateDataStore("PlayerData", {
-    Schema = DataTemplate
-}) -- You now have autocomplete for session.Data!
+local MoneyStore: PersonaStore.Founder<typeof(Template)> = PersonaStore:CreateDataStore("MoneyStats_v1", {
+	Schema = Template
+}) -- You now have autocomplete!
+
+local sessions = {}
 
 Players.PlayerAdded:Connect(function(player)
-    local session = PlayerStore:LoadSession(tostring(player.UserId))
+	local session = MoneyStore:LoadSessionAsync(tostring(player.UserId), 10)
+	if not session then
+		player:Kick("Failed to load session your session. Please rejoin.")
+		return
+	end
+	
+    local leaderstats = Instance.new("Folder", player)
+	leaderstats.Name = "leaderstats"
+	
+    local money = Instance.new("IntValue", leaderstats)
+    money.Name = "Money"
+	money.Value = session.Data.Money
+	
+    local kills = Instance.new("IntValue", leaderstats)
+    kills.Name = "Kills"
+	kills.Value = session.Data.Kills
+	
+	session[player.UserId] = session
+	
+	session:ListenToFieldChange(function(_, new, root)
+		if root == "Kills" then
+			kills.Value = new
+		end
+		
+		if root == "Money" then
+			money.Value = new
+		end
+	end)
+end)
 
-    if not session then
-        player:Kick("Unable to load your profile.")
-        return
-    end
-
-    session.Data.Coins += 500
-
-    player.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            session:Destroy()
-        end
-    end)
+Players.PlayerRemoving:Connect(function(player)
+	local session = sessions[player.UserId]
+	if session then
+		session:Destroy()
+	end
+	
+	sessions[player.UserId] = nil
 end)
 ```
 
