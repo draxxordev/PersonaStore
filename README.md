@@ -123,12 +123,12 @@ PersonaStore is composed of three primary objects.
 
 # Example
 
+> Without Generic Types (No AutoComplete)
 ```lua
 local ServerStorage = game:GetService("ServerStorage")
 local Players = game:GetService("Players")
 
 local PersonaStore = require(ServerStorage.PersonaStore)
-
 PersonaStore:Init()
 
 local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
@@ -139,7 +139,41 @@ local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
 })
 
 Players.PlayerAdded:Connect(function(player)
+    local session = PlayerStore:LoadSession(tostring(player.UserId))
 
+    if not session then
+        player:Kick("Unable to load your profile.")
+        return
+    end
+
+    session.Data.Coins += 500
+
+    player.AncestryChanged:Connect(function(_, parent)
+        if not parent then
+            session:Destroy()
+        end
+    end)
+end)
+```
+
+> With Generic Types (AutoComplete For Data)
+```lua
+local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
+
+local PersonaStore = require(ServerStorage.PersonaStore)
+PersonaStore:Init()
+
+local DataTemplate = {
+    Coins = 0,
+    Inventory = {}
+}
+
+local PlayerStore: PersonaStore.Founder<typeof(DataTemplate)> = PersonaStore:CreateDataStore("PlayerData", {
+    Schema = DataTemplate
+}) -- You now have autocomplete for session.Data!
+
+Players.PlayerAdded:Connect(function(player)
     local session = PlayerStore:LoadSession(tostring(player.UserId))
 
     if not session then
