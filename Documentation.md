@@ -1,6 +1,6 @@
 # PersonaStore Documentation
 
-PersonaStore is a robust, production-ready DataStore persistence framework with native Roblox EncodingService integration, compression, data integrity verification, and advanced session management. It also wraps OrderedDataStores, MemoryStoreService, and DataStore versioning behind the same retry/backoff layer as the core profile engine.
+PersonaStore is a robust, production-ready DataStore persistence framework with native EncodingService integration, compression, data integrity verification, and advanced session management. It also wraps OrderedDataStores, MemoryStoreService, and DataStore versioning behind the same retry/backoff layer as the core profile engine.
 
 ## Table of Contents
 
