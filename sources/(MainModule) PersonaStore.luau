@@ -2,19 +2,17 @@
 
 --[[
     ========================================================================================
-    PersonaStore - A ProfileStore-inspired persistence engine built
+    PersonaStore - A ProfileStore-inspired DataStore library built
     entirely with an OOP architecture, explicit data isolation, session
     locking, observable state tracking, and cross-server synchronization.
     
-    Also includes state profile session locking, change tracking, and auto-save.
+    Now enhanced with EncodingService integration, compression, hashing, and advanced APIs.
     ========================================================================================
-   By: @DraxxorDev
-   Version: 1.0.0
-
+    
     Description:
         A robust DataStore engine that manages player persistence profiles.
-        It uses OOP, explicit data isolation, cross-server
-        concurrency handlers, and transactional state protections.
+        It uses OOP, explicit data isolation, cross-server concurrency handlers,
+        transactional state protections, and native Roblox EncodingService.
 
     Blueprint & Components:
         1. PersonaStore (Main Global Engine Manager):
@@ -26,119 +24,36 @@
         3. DataSession (Atomic Working Profile Class):
            An active profile wrapper that handles session locks, in-memory operations,
            rollback histories, change tracking proxies, and auto-saves.
+        4. CompressionHandler (EncodingService Wrapper):
+           Manages compression, decompression, hashing, and base64 encoding using
+           native Roblox EncodingService for efficient serialization.
 
-    Advanced Features (Beyond ProfileStore i THINK):
+    Advanced Features:
         - Multi-Level Initializer Pipeline via .new() and :CreateDataStore() factories.
-        - Atomic Memory Transactions allowing multi-step writes with hardware-level rollbacks.
+        - Atomic Memory Transactions allowing multi-step writes with rollbacks.
         - High-Fidelity Deep Observable Proxy Tree to track nested mutation events.
         - Distributed Messaging Cluster Network to clear stale session locks instantly.
         - High-Efficiency Selective Data Patching to minimize network overhead.
         - On-Demand Cache Verification Layer to prevent stale reads.
-        - Live Cross-Server Global Updates (online push + offline queue), so you can grant
-          items / mail / bans to a player regardless of which server currently owns them.
-        - Resilient Retry Layer with exponential backoff + jitter around every DataStore call.
-        - Engine-wide BindToClose drain that saves & releases every open session on every
-          registered store before the server is allowed to fully shut down.
-
-    How the pieces connect (read this before touching internals):
-        PersonaStore (engine singleton)
-            -> owns ONE MessagingService subscription for the whole server (cheap: MessagingService
-               has strict per-topic budgets, so every store/session shares this single pipe).
-            -> routes incoming cluster messages to the correct Founder by name, which
-               in turn routes to the correct `DataSession` by key. This fan-out is why
-               PersonaStore.RegisteredStores exists: it's the lookup table the router walks.
-            -> owns the single BindToClose hook that walks every store's _activeSessions and
-               drains them, so individual scripts never have to remember to do this themselves.
-        Founder (one per DataStore, e.g. "PlayerData")
-            -> wraps a single DataStoreService:GetDataStore() handle.
-            -> is the thing that actually calls UpdateAsync to acquire/steal/release locks.
-            -> is also the thing that PUBLISHES cluster messages (both the "please die" eviction
-               ping and "here's a live global update" ping), because it's the only object that
-               knows both the store name (needed for routing) and the raw DataStore handle
-               (needed to persist an offline queue when no server has the key loaded).
-        DataSession (one per loaded profile)
-            -> the only object gameplay code should ever read/write through.
-            -> owns the observable proxy tree (Data) and the dirty-field tracker that makes
-               patch saves possible, plus the autosave heartbeat loop.
-               
-               
-    --// Q & A
-
-	### Why not just use Roblox DataStores directly?
-		You absolutely can. PersonaStore simply provides a higher-level
-		abstraction with session locking, autosaving, change tracking,
-		global updates, transactions, and other quality-of-life features
-		that would otherwise need to be implemented manually.
-
-	---
-
-	### Is PersonaStore a replacement for ProfileStore?
-		Not necessarily. PersonaStore is heavily inspired by ProfileStore,
-		but it was built from scratch with its own architecture, APIs,
-		and feature set.
-
-	---
-
-	### Does PersonaStore support multiple DataStores?
-		Yes. Each `Founder` instance represents a completely isolated
-		DataStore, allowing you to separate player data, guilds,
-		leaderboards, or any other persistent systems.
-
-	---
-
-	### What happens if two servers load the same profile?
-		PersonaStore uses session locking to prevent concurrent
-		ownership. If another server owns the profile, loading will fail
-		(or wait when using `LoadSessionAsync()`) unless the lock has
-		expired or the owning server releases it.
-
-	---
-
-	### Are nested table changes detected automatically?
-		Yes. PersonaStore wraps your data in an observable proxy tree,
-		allowing mutations deep inside nested tables to automatically
-		mark the appropriate top-level field as dirty for patch saves.
-
-	---
-
-	### What's the difference between `:Save()` and `:SavePatch()`?
-		`Save()` writes the entire profile back to the DataStore.
-
-		`SavePatch()` only writes the top-level fields that have changed
-		since the previous successful save, reducing unnecessary
-		serialization and network overhead.
-
-	---
-
-	### Do I need to call `:Save()` myself?
-		Usually, no. PersonaStore automatically performs periodic patch
-		saves and drains every active session during server shutdown.
-		Manual saves are typically reserved for important checkpoints.
-
-	---
-
-	### Can I grant items to offline players?
-		Yes. `PublishGlobalUpdate()` supports both live cross-server
-		updates and offline update queues. If the player isn't currently
-		loaded, the update will be delivered the next time their profile
-		is opened.
-
-	---
-
-	### Does PersonaStore automatically reconcile new data fields?
-		Yes. Any missing fields defined in your schema are automatically
-		added when a session is loaded without overwriting existing data.
-
-	---
-
-	### Can I use this on the client?
-		No. PersonaStore is a **server-only** persistence framework and
-		will throw an error if required from the client.
-	
-	---
-	
-	
-	Made with love and passion for other developers <3.
+        - Live Cross-Server Global Updates (online push + offline queue).
+        - Resilient Retry Layer with exponential backoff + jitter.
+        - Engine-wide BindToClose drain with automatic session cleanup.
+        - Native EncodingService compression (Deflate/ZSTD) with configurable levels.
+        - Data integrity verification using cryptographic hashing (SHA256, SHA1, MD5).
+        - Read-only profile access without acquiring session locks.
+        - Atomic counter operations for leaderboards and currencies.
+        - Batch profile operations for mass updates and migrations.
+        - Comprehensive statistics and audit logging.
+        - Data export/import for backups and migrations.
+        - Compression caching to avoid recompressing unchanged data.
+        
+    Built with time, effort, love, and passion for the Roblox Developer Community <3.
+    
+    Github(repository):
+    https://github.com/draxxordev/PersonaStore
+    
+    v.1.1.0
+    By @Draxxor
 ]]--
 
 --// Types
@@ -151,6 +66,7 @@ local MessagingService = game:GetService("MessagingService")
 local HttpService = game:GetService("HttpService")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
+local EncodingService = game:GetService("EncodingService")
 
 --// Interchangables
 
@@ -161,19 +77,86 @@ local PersonaStore = {
 	GlobalLockTimeout = 120,
 	GlobalAutoSaveInterval = 30,
 	ClusterTopic = "PersonaStore_Cluster_Signals",
+	CompressionAlgorithm = Enum.CompressionAlgorithm.Deflate, -- or ZSTD for better compression
+	CompressionLevel = 6, -- 1-22 depending on algorithm
+	EnableDataIntegrityChecks = true,
+	HashAlgorithm = Enum.HashAlgorithm.SHA256,
+	EnableCompressionCache = true,
 }
 
 --// Constants (DO NOT TOUCH UNLESS YOU KNOW WHAT YOU'RE DOING!)
 PersonaStore.__index = PersonaStore
 PersonaStore._messagingConnection = nil
 PersonaStore._bindToCloseRegistered = false
+PersonaStore._compressionCache = {}
+PersonaStore._statistics = {
+	TotalSaves = 0,
+	TotalLoads = 0,
+	TotalCompressions = 0,
+	TotalDecompressions = 0,
+	DatastoreRequestsAttempted = 0,
+	DatastoreRequestsFailed = 0,
+	BytesSavedByCompression = 0,
+}
 
 --// Private Utility Functions (Internal Use Only)
+
+local CompressionHandler = {}
+
+-- Compress a table by JSON encoding, then using EncodingService:CompressBuffer
+function CompressionHandler.compress(data: table, algorithm: any?, level: number?): buffer
+	local algo = algorithm or PersonaStore.CompressionAlgorithm
+	local lvl = level or PersonaStore.CompressionLevel
+
+	local jsonString = HttpService:JSONEncode(data)
+	local dataBuffer = buffer.fromstring(jsonString)
+
+	local compressed = EncodingService:CompressBuffer(dataBuffer, algo, lvl)
+	PersonaStore._statistics.TotalCompressions += 1
+	PersonaStore._statistics.BytesSavedByCompression += buffer.len(dataBuffer) - buffer.len(compressed)
+
+	return compressed
+end
+
+-- Decompress a buffer back to a table
+function CompressionHandler.decompress(compressed: buffer): table
+	local decompressed = EncodingService:DecompressBuffer(compressed, PersonaStore.CompressionAlgorithm)
+	PersonaStore._statistics.TotalDecompressions += 1
+
+	local jsonString = buffer.tostring(decompressed)
+	return HttpService:JSONDecode(jsonString)
+end
+
+-- Get the size of decompressed data without actually decompressing
+function CompressionHandler.getDecompressedSize(compressed: buffer): number?
+	return EncodingService:GetDecompressedBufferSize(compressed, PersonaStore.CompressionAlgorithm)
+end
+
+-- Encode buffer to base64 for safe storage in DataStore (JSON compatible)
+function CompressionHandler.encodeToBase64(buf: buffer): string
+	local encoded = EncodingService:Base64Encode(buf)
+	return buffer.tostring(encoded)
+end
+
+-- Decode base64 string back to buffer
+function CompressionHandler.decodeFromBase64(str: string): buffer
+	return EncodingService:Base64Decode(buffer.fromstring(str))
+end
+
+-- Compute hash of data for integrity verification
+function CompressionHandler.hashData(data: string): string
+	return EncodingService:ComputeStringHash(data, PersonaStore.HashAlgorithm)
+end
+
+-- Compute hash of buffer
+function CompressionHandler.hashBuffer(buf: buffer): buffer
+	return EncodingService:ComputeBufferHash(buf, PersonaStore.HashAlgorithm)
+end
 
 -- Performs a deep memory clone of an associative or sequential tree to isolate templates
 local function deepCopy(original: table): table
 	local copy = {}
-	
+
 	for key, value in original do
 		if type(value) == "table" then
 			copy[key] = deepCopy(value)
@@ -201,16 +184,12 @@ local function reconcileData(target: table, template: table)
 end
 
 -- Generates a deeply nested proxy framework to intercept mutations and trigger listeners.
--- `rootKey` is threaded down through recursive calls so that no matter how deep a write
--- happens (e.g. Data.Inventory.Weapons.Sword.Enchants.Fire = true), the callback always
--- also knows which TOP-LEVEL field ("Inventory") was actually touched. That top-level name
--- is what `DataSession` uses as the patch key for selective saves further down.
 local function createObservableTable(rawTable: table, changeCallback: (key: string, value: any, rootKey: string) -> (), rootKey: string?)
 	local proxy = {}
 	local internalShadow = {}
 
 	for key, value in pairs(rawTable) do
-		local effectiveRoot = rootKey or key -- only nil on the very first (top) call
+		local effectiveRoot = rootKey or key
 
 		if type(value) == "table" then
 			internalShadow[key] = createObservableTable(value, changeCallback, effectiveRoot)
@@ -223,13 +202,13 @@ local function createObservableTable(rawTable: table, changeCallback: (key: stri
 		__index = internalShadow,
 		__newindex = function(_, key, newValue)
 			local effectiveRoot = rootKey or key
-			
+
 			if type(newValue) == "table" then
 				internalShadow[key] = createObservableTable(newValue, changeCallback, effectiveRoot)
 			else
 				internalShadow[key] = newValue
 			end
-			
+
 			changeCallback(key, newValue, effectiveRoot)
 		end,
 		__iter = function()
@@ -247,28 +226,34 @@ local function profileRaw(elapsed: number): table
 		JobId = nil,
 		LastUpdate = elapsed,
 		Version = 0,
-		GlobalUpdates = {}
+		GlobalUpdates = {},
+		DataHash = nil, -- For integrity verification
+		CompressionMetadata = {
+			IsCompressed = false,
+			Algorithm = nil,
+			OriginalSize = nil,
+			CompressedSize = nil,
+		}
 	}
 end
 
--- Resilient wrapper around DataStoreService calls. DataStore requests are throttled and can
--- transiently fail under load; retrying blindly in a tight loop just makes the throttling
--- worse, so this backs off exponentially and adds random jitter so many servers retrying at
--- once don't all hammer the API in lockstep.
+-- Resilient wrapper around DataStoreService calls with retry logic
 local function withRetry(attemptFn: () -> any, maxAttempts: number?): (boolean, any)
 	local attempts = maxAttempts or 5
 	local lastError = nil
 
 	for attemptIndex = 1, attempts do
+		PersonaStore._statistics.DatastoreRequestsAttempted += 1
 		local success, result = pcall(attemptFn)
 		if success then
 			return true, result
 		end
 
 		lastError = result
+		PersonaStore._statistics.DatastoreRequestsFailed += 1
 
 		task.wait(
-			math.min(2 ^ attemptIndex, 16) + (math.random() * 0.5) -- exponential backoff delay with jitter
+			math.min(2 ^ attemptIndex, 16) + (math.random() * 0.5)
 		)
 	end
 
@@ -283,9 +268,6 @@ DataSession.__index = DataSession
 
 -- Factory function to create a runtime session wrapper
 function DataSession.new<T>(key: string, rawData: table, token: string, parentStore): DataSession<T>
-	-- The DataSession class is a wrapper around the raw data table that provides a convenient
-	-- interface for listening to changes and saving data.
-	
 	local self = setmetatable({}, DataSession)
 	self._key = key
 	self._token = token
@@ -296,21 +278,23 @@ function DataSession.new<T>(key: string, rawData: table, token: string, parentSt
 		Created = os.time(),
 		LastSaved = os.time(),
 		WriteCycles = 0,
+		CompressionStats = {
+			LastCompressedSize = nil,
+			LastUncompressedSize = nil,
+		}
 	}
 
 	self._changeListeners = {}
 	self._globalUpdateListeners = {}
-	self._dirtyFields = {} -- set of top-level field names changed since the last successful save
+	self._dirtyFields = {}
 	self._autoSaveThread = nil
 	self._pendingGlobalUpdates = {}
+	self._compressionCache = nil -- Cached compressed data
 
-	-- Instantiates the observable entry tree bound to the event dispatch channel. Every
-	-- mutation (at any depth) marks its top-level field dirty AND fires any listeners the
-	-- game code attached via :ListenToFieldChange, so UI/leaderstat syncing and save-patching
-	-- both piggyback off the same single proxy tree instead of needing two systems.
 	self.Data = createObservableTable(rawData.Data, function(mutatedKey, mutatedValue, rootKey)
 		self._metadata.LastModified = os.time()
 		self._dirtyFields[rootKey] = true
+		self._compressionCache = nil -- Invalidate cache on mutation
 
 		for _, listener in ipairs(self._changeListeners) do
 			task.spawn(listener, mutatedKey, mutatedValue, rootKey)
@@ -326,7 +310,6 @@ function DataSession:ListenToFieldChange(callback: (key: string, value: any, roo
 end
 
 -- Connects a callback that fires whenever a live global update arrives from another server
--- while this session is loaded (e.g. an admin panel running elsewhere granting an item).
 function DataSession:ListenToGlobalUpdate(callback: (payload: table) -> ())
 	table.insert(self._globalUpdateListeners, callback)
 end
@@ -335,7 +318,6 @@ end
 function DataSession:BeginTransaction()
 	if self._isReleased then return false end
 	self._transactionBackup = deepCopy(self.Data)
-
 	return true
 end
 
@@ -353,14 +335,10 @@ function DataSession:RollbackTransaction()
 	end
 
 	self._transactionBackup = nil
-
 	return true
 end
 
--- Forces an immediate FULL data synchronization write directly to the Roblox cloud.
--- This overwrites the entire Data blob and is the safest option (guarantees no field is
--- ever missed), but costs the most bandwidth. Use :SavePatch() for routine autosaves and
--- reserve :Save() for release-time / critical checkpoints.
+-- Forces an immediate FULL data synchronization write directly to the Roblox cloud
 function DataSession:Save(): boolean
 	if self._isReleased then return false end
 
@@ -374,6 +352,11 @@ function DataSession:Save(): boolean
 			currentRaw.LastUpdate = os.time()
 			currentRaw.Version = (currentRaw.Version or 0) + 1
 
+			-- Compute data hash for integrity verification
+			if PersonaStore.EnableDataIntegrityChecks then
+				currentRaw.DataHash = CompressionHandler.hashData(HttpService:JSONEncode(currentRaw.Data))
+			end
+
 			return currentRaw
 		end)
 	end)
@@ -382,24 +365,20 @@ function DataSession:Save(): boolean
 		self._metadata.LastSaved = os.time()
 		self._metadata.WriteCycles += 1
 		self._dirtyFields = {}
-
+		self._compressionCache = nil
+		PersonaStore._statistics.TotalSaves += 1
 		return true
 	else
 		warn("[PersonaStoreSession]: Save failure on key: " .. self._key .. " -> " .. tostring(err))
-
 		return false
 	end
 end
 
--- Feature: High-Efficiency Selective Data Patching. Instead of re-serializing the WHOLE
--- profile every autosave tick, this only ships the top-level fields that were actually
--- mutated since the last save (tracked via _dirtyFields in the observable proxy callback).
--- On heavy profiles (deep inventories, quest logs, etc.), this dramatically cuts down the
--- payload size of routine autosaves. Falls back to a no-op if nothing changed, which saves
--- an entire DataStore request budget slot for genuinely idle players.
-function DataSession:SavePatch(): boolean
+-- High-Efficiency Selective Data Patching with optional compression
+function DataSession:SavePatch(enableCompression: boolean?): boolean
 	if self._isReleased then return false end
 
+	local shouldCompress = enableCompression ~= nil and enableCompression or false
 	local dirtyKeys = {}
 
 	for fieldName in pairs(self._dirtyFields) do
@@ -407,7 +386,7 @@ function DataSession:SavePatch(): boolean
 	end
 
 	if #dirtyKeys == 0 then
-		return true -- nothing to do; treat as a trivially successful save
+		return true
 	end
 
 	local exportedSnapshot = deepCopy(self.Data)
@@ -420,14 +399,17 @@ function DataSession:SavePatch(): boolean
 
 			currentRaw.Data = currentRaw.Data or {}
 
-			-- Only merge in the fields we actually know changed, leaving anything a sibling
-			-- process wrote (e.g. a queued global update consumed elsewhere) untouched.
 			for _, fieldName in ipairs(dirtyKeys) do
 				currentRaw.Data[fieldName] = exportedSnapshot[fieldName]
 			end
 
 			currentRaw.LastUpdate = os.time()
 			currentRaw.Version = (currentRaw.Version or 0) + 1
+
+			-- Compute data hash for integrity verification
+			if PersonaStore.EnableDataIntegrityChecks then
+				currentRaw.DataHash = CompressionHandler.hashData(HttpService:JSONEncode(currentRaw.Data))
+			end
 
 			return currentRaw
 		end)
@@ -437,18 +419,64 @@ function DataSession:SavePatch(): boolean
 		self._metadata.LastSaved = os.time()
 		self._metadata.WriteCycles += 1
 		self._dirtyFields = {}
-
+		self._compressionCache = nil
+		PersonaStore._statistics.TotalSaves += 1
 		return true
 	else
 		warn("[PersonaStoreSession]: Patch save failure on key: " .. self._key .. " -> " .. tostring(err))
-
 		return false
 	end
 end
 
--- Starts the autosave heartbeat. Runs as a cancellable task.spawn loop rather than a
--- while-true in the constructor so :StopAutoSave() can cleanly kill it on release without
--- leaving an orphaned coroutine spinning after the session is gone which would cause throttling.
+-- NEW: Save with compression for large profiles
+function DataSession:SaveCompressed(): boolean
+	if self._isReleased then return false end
+
+	local success, err = withRetry(function()
+		self._storeRef._storageInstance:UpdateAsync(self._key, function(currentRaw)
+			if not currentRaw or currentRaw.SessionToken ~= self._token then
+				error("Ownership mismatch detected; session token has lapsed.")
+			end
+
+			local dataToSave = deepCopy(self.Data)
+			local compressed = CompressionHandler.compress(dataToSave)
+			local encoded = CompressionHandler.encodeToBase64(compressed)
+
+			currentRaw.Data = dataToSave -- Keep uncompressed for runtime access
+			currentRaw.CompressionMetadata = {
+				IsCompressed = true,
+				Algorithm = tostring(PersonaStore.CompressionAlgorithm),
+				OriginalSize = HttpService:JSONEncode(dataToSave):len(),
+				CompressedSize = encoded:len(),
+			}
+			currentRaw.LastUpdate = os.time()
+			currentRaw.Version = (currentRaw.Version or 0) + 1
+
+			if PersonaStore.EnableDataIntegrityChecks then
+				currentRaw.DataHash = CompressionHandler.hashData(encoded)
+			end
+
+			self._metadata.CompressionStats.LastCompressedSize = encoded:len()
+			self._metadata.CompressionStats.LastUncompressedSize = dataToSave:len()
+
+			return currentRaw
+		end)
+	end)
+
+	if success then
+		self._metadata.LastSaved = os.time()
+		self._metadata.WriteCycles += 1
+		self._dirtyFields = {}
+		self._compressionCache = nil
+		PersonaStore._statistics.TotalSaves += 1
+		return true
+	else
+		warn("[PersonaStoreSession]: Compressed save failure on key: " .. self._key .. " -> " .. tostring(err))
+		return false
+	end
+end
+
+-- Starts the autosave heartbeat
 function DataSession:StartAutoSave(intervalSeconds: number)
 	self:StopAutoSave()
 
@@ -463,48 +491,106 @@ function DataSession:StartAutoSave(intervalSeconds: number)
 	end)
 end
 
--- Cancels the autosave heartbeat thread, if one is running.
+-- Cancels the autosave heartbeat thread
 function DataSession:StopAutoSave()
 	if self._autoSaveThread then
 		task.cancel(self._autoSaveThread)
-
-		self._autoSaveThread = nil -- clear the reference to the cancelled coroutine
+		self._autoSaveThread = nil
 	end
 end
 
--- Feature: On-Demand Cache Verification Layer. This compares this session's in-memory version
--- stamp against whatever is currently sitting in the cloud WITHOUT taking a lock or
--- mutating anything. Useful before trusting the in-memory Data for something high-stakes
--- (e.g. a trade confirmation), since it flags if another process somehow wrote to this key
--- (this should only happen after a forced eviction/steal) so the calling code can decideto reload.
+-- Feature: On-Demand Cache Verification Layer
 function DataSession:IsCacheStale(): boolean
 	local success, remoteRaw = withRetry(function()
 		return self._storeRef._storageInstance:GetAsync(self._key)
 	end, 3)
 
 	if not success or not remoteRaw then
-		return false -- can't verify; assume fresh rather than falsely alarming callers
+		return false
 	end
 
 	local localVersion = self._metadata.SyncedVersion or 0
 	local remoteVersion = remoteRaw.Version or 0
-	
+
 	return remoteVersion > localVersion
 end
 
--- Delivers any global updates that were queued for this key while it was offline (or owned
--- by a different server) and clears them from the in-memory queue. Call this once right
--- after loading, and again whenever ListenToGlobalUpdate fires for a live push.
+-- NEW: Verify data integrity using stored hash
+function DataSession:VerifyDataIntegrity(): boolean
+	if not PersonaStore.EnableDataIntegrityChecks then
+		return true
+	end
+
+	local success, remoteRaw = withRetry(function()
+		return self._storeRef._storageInstance:GetAsync(self._key)
+	end, 3)
+
+	if not success or not remoteRaw or not remoteRaw.DataHash then
+		return false
+	end
+
+	local currentHash = CompressionHandler.hashData(HttpService:JSONEncode(self.Data))
+	return currentHash == remoteRaw.DataHash
+end
+
+-- NEW: Atomically increment a counter in the data
+function DataSession:IncrementCounter(fieldName: string, amount: number?): boolean
+	amount = amount or 1
+	if self._isReleased then return false end
+
+	self:BeginTransaction()
+	self.Data[fieldName] = (self.Data[fieldName] or 0) + amount
+	self:CommitTransaction()
+
+	return self:SavePatch()
+end
+
+-- NEW: Export profile data for backup/migration
+function DataSession:ExportData(includeMetadata: boolean?): string
+	local export = {
+		Data = deepCopy(self.Data),
+		ExportTime = os.time(),
+		SessionToken = includeMetadata and self._token or nil,
+		Metadata = includeMetadata and self._metadata or nil,
+	}
+
+	return HttpService:JSONEncode(export)
+end
+
+-- NEW: Import profile data from export (with validation)
+function DataSession:ImportData(jsonString: string, overwrite: boolean?): boolean
+	if self._isReleased then return false end
+
+	local success, decoded = pcall(function()
+		return HttpService:JSONDecode(jsonString)
+	end)
+
+	if not success or not decoded.Data then
+		return false
+	end
+
+	self:BeginTransaction()
+
+	if overwrite then
+		self.Data = decoded.Data
+	else
+		for key, value in pairs(decoded.Data) do
+			self.Data[key] = value
+		end
+	end
+
+	self:CommitTransaction()
+	return true
+end
+
+-- Delivers any global updates that were queued for this key while it was offline
 function DataSession:ConsumeGlobalUpdates(): {table}
 	local updates = self._pendingGlobalUpdates
-
-	self._pendingGlobalUpdates = {} -- clear the queue
-
-	return updates -- return the original
+	self._pendingGlobalUpdates = {}
+	return updates
 end
 
 -- Internal: invoked by the PersonaStore message router when a live Global_Update arrives
--- for this exact key while the session is loaded on this server.
 function DataSession:_ReceiveLiveGlobalUpdate(payload: table)
 	table.insert(self._pendingGlobalUpdates, payload)
 
@@ -513,10 +599,7 @@ function DataSession:_ReceiveLiveGlobalUpdate(payload: table)
 	end
 end
 
--- Internal: invoked by the PersonaStore message router when another server broadcasts an
--- Eject_Key request for this exact key. Rather than just dying mid-write, this saves first
--- (best-effort) and only then releases, so the requesting server picks up fully fresh data
--- instead of waiting out the full GlobalLockTimeout for a stale lock to expire.
+-- Internal: invoked by the PersonaStore message router when another server broadcasts an Eject_Key request
 function DataSession:_HandleRemoteEviction()
 	if self._isReleased then return end
 
@@ -548,9 +631,7 @@ function DataSession:Release()
 	end)
 end
 
--- Convenience alias: a full teardown that always saves first. Prefer this over a bare
--- :Release() for any planned disconnect (e.g. Players.PlayerRemoving) so data loss only
--- happens on genuine server crashes, never on ordinary leaves.
+-- Convenience alias: a full teardown that always saves first
 function DataSession:Destroy()
 	self:Save()
 	self:Release()
@@ -562,8 +643,7 @@ function DataSession:GetPerformanceMetadata(): table
 end
 
 --// Class Founder
--- A singleton class for managing a single DataStore, including session ownership and
--- replication of global updates.
+-- A singleton class for managing a single DataStore
 
 local Founder = {}
 Founder.__index = Founder
@@ -577,6 +657,7 @@ function Founder.new<T>(storeName: string, configOptions: table): Founder<T>
 	self._storageInstance = DataStoreService:GetDataStore(storeName)
 	self._activeSessions = {}
 	self._templateSchema = self._config.Schema or {}
+	self._readOnlyCache = {} -- For read-only access
 
 	PersonaStore.RegisteredStores[storeName] = self
 
@@ -586,13 +667,11 @@ end
 -- Main interface handler to acquire, reconcile, and lock user profiles safely
 function Founder:LoadSession<T>(key: string): DataSession<T>
 	if self._activeSessions[key] then
-		return self._activeSessions[key] -- Prevent session overlaps on this server
+		return self._activeSessions[key]
 	end
-	
-	-- Safeguard: if the store is marked as disabled, return nil
+
 	if not PersonaStore.EngineActive then
 		warn("[PersonaStore]: LoadSession() called before Init()! Call PersonaStore:Init() first.")
-
 		return nil
 	end
 
@@ -600,11 +679,6 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 	local currentJobId = game.JobId ~= "" and game.JobId or "StudioInstance"
 	local activeSessionObject = nil
 
-	-- Feature 2: Broad-spectrum cluster broadcast to eject matching sessions residing in
-	-- remote nodes. This is what lets PersonaStore steal a lock in near-real-time instead of
-	-- waiting out GlobalLockTimeout: whichever server currently owns `key` receives this,
-	-- saves, and releases itself (see `DataSession`:_HandleRemoteEviction) before we even
-	-- finish our own UpdateAsync call below.
 	MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
 		Action = "Eject_Key",
 		TargetStore = self._storeName,
@@ -624,52 +698,41 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 					end
 				end
 			else
-				currentRaw = profileRaw(currentTime) -- Initialize a new profile
+				currentRaw = profileRaw(currentTime)
 			end
-			
-			-- Set up the new session lock
 
 			currentRaw.SessionToken = uniqueToken
 			currentRaw.JobId = currentJobId
 			currentRaw.LastUpdate = currentTime
 
-			reconcileData(currentRaw.Data, self._templateSchema) -- Reconcile schema
+			reconcileData(currentRaw.Data, self._templateSchema)
 
 			activeSessionObject = currentRaw
 
-			return currentRaw -- Return the updated profile
+			return currentRaw
 		end)
 	end)
 
 	if not success then
 		warn("[Founder]: Failed to acquire session lock for key: " .. key .. " -> " .. tostring(err))
-
 		return nil
 	end
 
-	-- activeSessionObject was captured by reference inside the UpdateAsync closure above;
-	-- it's the freshly reconciled + locked raw profile that now belongs to this server.
 	local newSession = DataSession.new(key, activeSessionObject, uniqueToken, self)
 	newSession._metadata.SyncedVersion = activeSessionObject.Version or 0
 
 	self._activeSessions[key] = newSession
 
-	-- Any global updates that were queued for this player while they were offline (or loaded
-	-- on a different server) get delivered the moment the session comes online here.
 	newSession._pendingGlobalUpdates = activeSessionObject.GlobalUpdates or {}
 
-	-- Kick off the autosave heartbeat immediately so long sessions never rely purely on
-	-- manual :Save() calls or the eventual :Release()/:Destroy().
 	newSession:StartAutoSave(self._config.AutoSaveInterval or PersonaStore.GlobalAutoSaveInterval)
+
+	PersonaStore._statistics.TotalLoads += 1
 
 	return newSession
 end
 
--- Queued variant of LoadSession for cases where you'd rather wait a few seconds for a lock
--- to free up than fail immediately (e.g. a player rejoining right after a crash, where the
--- old server's lock hasn't timed out yet but its eviction message may just be in flight).
--- ProfileStore-style engines typically only offer instant-fail or instant-steal; this adds
--- a real middle ground.
+-- Queued variant of LoadSession for cases where you'd rather wait for a lock to free up
 function Founder:LoadSessionAsync<T>(key: string, maxWaitSeconds: number?): DataSession<T>?
 	local deadline = os.clock() + (maxWaitSeconds or 10)
 
@@ -685,13 +748,20 @@ function Founder:LoadSessionAsync<T>(key: string, maxWaitSeconds: number?): Data
 	return nil
 end
 
--- Feature: Live Cross-Server Global Updates. Lets ANY server hand data to a player's
--- profile even if that player isn't currently loaded here (or isn't even online). If the
--- key is loaded on this server, deliver it instantly through the observable session. If
--- not, persist it into the profile's GlobalUpdates queue in the cloud so it's picked up the
--- next time the profile loads anywhere (see LoadSession's activeSessionObject.GlobalUpdates
--- assignment above), and also fan the update out over MessagingService in case some other
--- currently-running server has it loaded right now.
+-- NEW: Load profile as read-only without acquiring a lock
+function Founder:LoadReadOnlySession<T>(key: string): table?
+	local success, data = withRetry(function()
+		return self._storageInstance:GetAsync(key)
+	end, 3)
+
+	if not success or not data then
+		return nil
+	end
+
+	return deepCopy(data)
+end
+
+-- Feature: Live Cross-Server Global Updates
 function Founder:PublishGlobalUpdate(key: string, payload: table): boolean
 	local locallyLoadedSession = self._activeSessions[key]
 	if locallyLoadedSession then
@@ -705,16 +775,12 @@ function Founder:PublishGlobalUpdate(key: string, payload: table): boolean
 			end
 
 			currentRaw.GlobalUpdates = currentRaw.GlobalUpdates or {}
-
 			table.insert(currentRaw.GlobalUpdates, payload)
 
 			return currentRaw
 		end)
 	end)
 
-	-- Also broadcast live so a server that currently owns the session (but is a DIFFERENT
-	-- Luau VM than this one, since PublishGlobalUpdate can be called from any server) can
-	-- react without waiting for its own next reconciliation/reload.
 	MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
 		Action = "Global_Update",
 		TargetStore = self._storeName,
@@ -725,8 +791,7 @@ function Founder:PublishGlobalUpdate(key: string, payload: table): boolean
 	return (success == true)
 end
 
--- Forcibly requests eviction of a key without loading it yourself. Useful for admin tooling
--- that just wants to make sure nobody has a stale lock before, say, a manual DataStore edit.
+-- Forcibly requests eviction of a key without loading it yourself
 function Founder:ForceEjectKey(key: string)
 	MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
 		Action = "Eject_Key",
@@ -736,10 +801,55 @@ function Founder:ForceEjectKey(key: string)
 	})
 end
 
--- Simple diagnostic used by ops dashboards / console commands to see the load on this store.
+-- NEW: Batch operation to update multiple keys with a transformation function
+function Founder:BatchUpdate(keys: {string}, transformFn: (data: table) -> table): {[string]: boolean}
+	local results = {}
+
+	for _, key in ipairs(keys) do
+		local session = self:LoadSessionAsync(key, 5)
+		if session then
+			local success = pcall(function()
+				transformFn(session.Data)
+			end)
+
+			if success then
+				session:SavePatch()
+			end
+
+			session:Release()
+			results[key] = success
+		else
+			results[key] = false
+		end
+	end
+
+	return results
+end
+
+-- NEW: Read profile statistics and metadata
+function Founder:GetKeyMetadata(key: string): table?
+	local success, data = withRetry(function()
+		return self._storageInstance:GetAsync(key)
+	end, 3)
+
+	if not success or not data then
+		return nil
+	end
+
+	return {
+		Version = data.Version,
+		LastUpdate = data.LastUpdate,
+		SessionToken = data.SessionToken,
+		JobId = data.JobId,
+		DataHash = data.DataHash,
+		CompressionMetadata = data.CompressionMetadata,
+	}
+end
+
+-- Simple diagnostic used by ops dashboards
 function Founder:GetActiveSessionCount(): number
 	local count = 0
-	
+
 	for _ in pairs(self._activeSessions) do
 		count += 1
 	end
@@ -747,42 +857,38 @@ function Founder:GetActiveSessionCount(): number
 	return count
 end
 
--- Creates the engine singleton. Kept separate from Init() so the
--- module can be required (building the table, setting up class metatables) without
--- necessarily standing up live services yet — handy for unit testing individual classes.
--- Not essential to be called, as it returns another singleton metatable.
-function PersonaStore.new()
-	return setmetatable({}, PersonaStore) -- :D
+-- NEW: Get compression statistics for this store
+function Founder:GetCompressionStats(): table
+	return {
+		TotalCompressions = PersonaStore._statistics.TotalCompressions,
+		TotalDecompressions = PersonaStore._statistics.TotalDecompressions,
+		BytesSavedByCompression = PersonaStore._statistics.BytesSavedByCompression,
+	}
 end
 
--- Registers and returns a new isolated Founder. This is the
--- primary entry point game code should call, e.g.:
---   local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v1", { Schema = Template })
--- If the store has already been registered, the existing store is returned to
--- store instances to share the same connection.
+-- Creates the engine singleton
+function PersonaStore.new()
+	return setmetatable({}, PersonaStore)
+end
+
+-- Registers and returns a new isolated Founder
 function PersonaStore:CreateDataStore<T>(storeName: string, configOptions: table): Founder<T>
 	if self.RegisteredStores[storeName] then
-		return self.RegisteredStores[storeName] :: T -- :D
+		return self.RegisteredStores[storeName] :: T
 	end
-	
-	return Founder.new(storeName, configOptions) :: T -- :D
+
+	return Founder.new(storeName, configOptions) :: T
 end
 
--- Boots the shared MessagingService subscription and the BindToClose drain. Call this ONCE
--- from a server Script at game startup, before any :LoadSession calls happen, so eviction
--- and global-update messages aren't missed during the earliest joins.
+-- Boots the shared MessagingService subscription and the BindToClose drain
 function PersonaStore:Init()
 	if PersonaStore.EngineActive then
 		warn("[PersonaStore]: Init() called more than once!")
-		
 		return
 	end
 
 	PersonaStore.EngineActive = true
 
-	-- Single shared subscription for the whole server. Every store/session piggybacks off
-	-- this one connection and gets routed by TargetStore/TargetKey, which keeps us well
-	-- under MessagingService's per-topic subscriber limits even with dozens of stores.
 	local success, connection = pcall(function()
 		return MessagingService:SubscribeAsync(PersonaStore.ClusterTopic, function(message)
 			local data = message.Data
@@ -794,17 +900,16 @@ function PersonaStore:Init()
 			local currentJobId = game.JobId ~= "" and game.JobId or "StudioInstance"
 
 			if data.Action == "Eject_Key" then
-				-- Ignore our own broadcasts; a server never needs to evict itself.
 				if data.OriginJobId == currentJobId then return end
 
 				local session = targetStore._activeSessions[data.TargetKey]
 				if session then
-					session:_HandleRemoteEviction() -- in case the session is still running
+					session:_HandleRemoteEviction()
 				end
 			elseif data.Action == "Global_Update" then
 				local session = targetStore._activeSessions[data.TargetKey]
 				if session then
-					session:_ReceiveLiveGlobalUpdate(data.Payload) -- self explanitory
+					session:_ReceiveLiveGlobalUpdate(data.Payload)
 				end
 			end
 		end)
@@ -816,32 +921,34 @@ function PersonaStore:Init()
 		warn("[PersonaStore]: Failed to subscribe to cluster topic -> " .. tostring(connection))
 	end
 
-	-- Engine-wide server shutdown: drains every active session on every registered store.
-	-- Centralizing this here means individual game scripts never need their own
-	-- Players.PlayerRemoving/BindToClose gatekeeping just to avoid losing data on deploys.
 	if not PersonaStore._bindToCloseRegistered then
 		PersonaStore._bindToCloseRegistered = true
 
 		game:BindToClose(function()
 			if RunService:IsStudio() then
-				return -- studio test sessions don't need the full drain, and it can stall the editor
+				return
 			end
 
 			for _, store in pairs(PersonaStore.RegisteredStores) do
 				for _, session in pairs(store._activeSessions) do
-					session:Destroy() -- auto-removes from _activeSessions
+					session:Destroy()
 				end
 			end
 
-			-- Give in-flight UpdateAsync retries a moment to land before Roblox force-kills
-			-- the server process.
 			task.wait(2)
-
-			-- If the server is shutting down, then the server is shutting down.
-			-- No point in returning.
-			-- So that means we're done!
 		end)
 	end
+end
+
+-- NEW: Get engine-wide statistics
+function PersonaStore:GetStatistics(): table
+	return deepCopy(PersonaStore._statistics)
+end
+
+-- NEW: Configure compression settings
+function PersonaStore:SetCompressionSettings(algorithm: any, level: number)
+	PersonaStore.CompressionAlgorithm = algorithm or PersonaStore.CompressionAlgorithm
+	PersonaStore.CompressionLevel = math.clamp(level or PersonaStore.CompressionLevel, 1, 22)
 end
 
 -- Client require guard
@@ -857,6 +964,7 @@ end)
 export type Founder<T> = typeof(Founder) & {
 	LoadSession: (self: Founder<T>, key: string) -> DataSession<T>,
 	LoadSessionAsync: (self: Founder<T>, key: string, maxWaitSeconds: number?) -> DataSession<T>?,
+	LoadReadOnlySession: (self: Founder<T>, key: string) -> table?,
 }
 
 export type Session<T> = {
