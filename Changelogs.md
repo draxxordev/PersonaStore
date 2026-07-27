@@ -168,4 +168,4 @@ PersonaStore is built with time, effort, love, and passion.
 **Version:** 1.1.0  
 **License:** MIT (or your preferred license)
 
-Made for developers by developers. 💜
+Made for developers by a developer. ❤
