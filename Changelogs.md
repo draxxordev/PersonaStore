@@ -10,6 +10,24 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 ## Added
 *OrderedDataStore, MemoryStore, Version APIs, and configurable integrity hashing*
 
+---
+
+## Changed
+- `withRetry()` no longer sleeps with exponential backoff after its *final* failed attempt (it used to wait needlessly before returning failure).
+- Profile schema (`profileRaw`) now includes a `FieldHashes` table alongside the existing `DataHash`.
+- `Founder:BatchUpdate()` no longer calls `SavePatch()` immediately before `Destroy()` — `Destroy()` already performs a full `Save()`, so every batched key was previously being written to the DataStore twice.
+
+---
+
+## Fixed
+- **Require guard threw the wrong error / retried needlessly.** The server-only guard was calling `withRetry(task.spawn(function() ... end))`, which passes a *thread* into `withRetry`. `withRetry` does `pcall(thread)` internally, and a thread isn't callable, so every one of its 5 attempts failed immediately (burning through exponential backoff) before finally surfacing an unrelated pcall error instead of the intended "server only" message. Fixed to call `withRetry` with an actual function and `maxAttempts = 1`.
+- **Decompression could use the wrong algorithm.** `CompressionHandler.decompress()` / `getDecompressedSize()` always decompressed using the *current global* `PersonaStore.CompressionAlgorithm` rather than whichever algorithm a given profile was actually compressed with. Calling `SetCompressionSettings()` to change the global algorithm made every previously-compressed profile fail to decompress correctly. Fixed by recording the algorithm's serialized name in `CompressionMetadata.Algorithm` at compress time and resolving it back to the correct `Enum.CompressionAlgorithm` at read time (`LoadSession`, `LoadReadOnlySnapshot`, and the new `GetVersionAsync` all go through this now).
+- **`VerifyDataIntegrity()` almost always returned `false`.** It hashed the live observable proxy (`self.Data`) directly via `HttpService:JSONEncode`, but every `Save()` path hashes `deepCopy(self.Data)` — a plain table. `JSONEncode` doesn't respect the proxy's `__iter` metamethod, so the two hashes were computed over different representations and essentially never matched. Fixed to `deepCopy` before hashing, consistent with the save paths.
+- **`BatchUpdate()` wrote every key twice.** See "Changed" above.
+- **Every save that computed an integrity hash failed with `CantStoreValue`.** `CompressionHandler.hashData()` returned the raw digest from `EncodingService:ComputeStringHash()` as-is, and stored it directly in `DataHash`/`FieldHashes`. Hash digests are effectively random bytes, not guaranteed valid UTF-8, and Roblox DataStores reject any string that isn't valid UTF-8 — so `Save()`/`SavePatch()` would fail on `UpdateAsync` every single time `PersonaStore.EnableDataIntegrityChecks` was on (the default). Fixed by base64-encoding the digest before it's stored or compared, the same approach already used for compressed buffer data.
+
+---
+
 ### Configurable Integrity Hashing
 - New `PersonaStore.IntegrityMode` setting with three modes:
   - `"Full"` *(default, back-compat)* — rehashes the entire profile on every `SavePatch()`, same as v1.1.x.
@@ -19,11 +37,15 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 - `DataSession:VerifyDataIntegrity()` is now integrity-mode-aware, checking `FieldHashes` in `"PerField"` mode instead of the whole-profile hash.
 - `Founder:GetKeyMetadata()` now also returns `FieldHashes`.
 
+---
+
 ### OrderedDataStore Support
 - New `OrderedFounder` class wrapping `DataStoreService:GetOrderedDataStore()`.
 - `PersonaStore:CreateOrderedDataStore(storeName)` factory, registered/cached like `CreateDataStore()`.
 - `OrderedFounder:Set(key, value)`, `:Get(key)`, `:Increment(key, delta)`, `:Remove(key)`.
 - `OrderedFounder:GetSortedPage(ascending, pageSize, minValue, maxValue)` for paginated leaderboard reads, returning both the current page and the native `DataStorePages` object for further pagination.
+
+---
 
 ### MemoryStoreService Support
 - New `MemoryQueueWrapper` over `MemoryStoreService:GetQueue()`.
@@ -34,22 +56,23 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
   - `:Set(key, value, expirationSeconds, sortKey)`, `:Get(key)`, `:Remove(key)`, `:GetRange(direction, count, exclusiveLowerBound, exclusiveUpperBound)`, `:Update(key, transformFn, expirationSeconds)`.
 - All MemoryStore calls go through the same `withRetry` backoff wrapper as DataStore calls.
 
+---
+
 ### DataStore Version APIs
 - `Founder:ListVersionsAsync(key, sortDirection, minDate, maxDate, pageSize)` — returns the native `DataStoreVersionPages` object.
 - `Founder:GetVersionAsync(key, version)` — returns a deep copy of a historical version, automatically decompressed if that version was stored compressed.
 - `Founder:RemoveVersionAsync(key, version)` — permanently deletes a historical version.
 
-## Changed
-- `withRetry()` no longer sleeps with exponential backoff after its *final* failed attempt (it used to wait needlessly before returning failure).
-- Profile schema (`profileRaw`) now includes a `FieldHashes` table alongside the existing `DataHash`.
-- `Founder:BatchUpdate()` no longer calls `SavePatch()` immediately before `Destroy()` — `Destroy()` already performs a full `Save()`, so every batched key was previously being written to the DataStore twice.
+---
 
-## Fixed
-- **Require guard threw the wrong error / retried needlessly.** The server-only guard was calling `withRetry(task.spawn(function() ... end))`, which passes a *thread* into `withRetry`. `withRetry` does `pcall(thread)` internally, and a thread isn't callable, so every one of its 5 attempts failed immediately (burning through exponential backoff) before finally surfacing an unrelated pcall error instead of the intended "server only" message. Fixed to call `withRetry` with an actual function and `maxAttempts = 1`.
-- **Decompression could use the wrong algorithm.** `CompressionHandler.decompress()` / `getDecompressedSize()` always decompressed using the *current global* `PersonaStore.CompressionAlgorithm` rather than whichever algorithm a given profile was actually compressed with. Calling `SetCompressionSettings()` to change the global algorithm made every previously-compressed profile fail to decompress correctly. Fixed by recording the algorithm's serialized name in `CompressionMetadata.Algorithm` at compress time and resolving it back to the correct `Enum.CompressionAlgorithm` at read time (`LoadSession`, `LoadReadOnlySnapshot`, and the new `GetVersionAsync` all go through this now).
-- **`VerifyDataIntegrity()` almost always returned `false`.** It hashed the live observable proxy (`self.Data`) directly via `HttpService:JSONEncode`, but every `Save()` path hashes `deepCopy(self.Data)` — a plain table. `JSONEncode` doesn't respect the proxy's `__iter` metamethod, so the two hashes were computed over different representations and essentially never matched. Fixed to `deepCopy` before hashing, consistent with the save paths.
-- **`BatchUpdate()` wrote every key twice.** See "Changed" above.
-- **Every save that computed an integrity hash failed with `CantStoreValue`.** `CompressionHandler.hashData()` returned the raw digest from `EncodingService:ComputeStringHash()` as-is, and stored it directly in `DataHash`/`FieldHashes`. Hash digests are effectively random bytes, not guaranteed valid UTF-8, and Roblox DataStores reject any string that isn't valid UTF-8 — so `Save()`/`SavePatch()` would fail on `UpdateAsync` every single time `PersonaStore.EnableDataIntegrityChecks` was on (the default). Fixed by base64-encoding the digest before it's stored or compared, the same approach already used for compressed buffer data.
+### DataStore Version API Notes
+
+* `ListVersionsAsync()` relies on Roblox's DataStore version history index, which may be eventually consistent after writes.
+* Newly created versions may not appear immediately after a successful `Save()` operation, especially in Studio.
+* PersonaStore's internal revision tracking remains authoritative for save ordering and mutation tracking.
+* Consumers using version enumeration for administrative tools or recovery workflows should retry `ListVersionsAsync()` when recently-created versions are expected.
+
+---
 
 ### Migration Notes for v1.1.0 → v1.2.0
 **100% Backward Compatible** — no breaking changes. `PersonaStore.IntegrityMode` defaults to `"Full"`, the same hashing behavior as v1.1.x, so nothing changes unless you opt in:
