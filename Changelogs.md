@@ -72,6 +72,330 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 * PersonaStore's internal revision tracking remains authoritative for save ordering and mutation tracking.
 * Consumers using version enumeration for administrative tools or recovery workflows should retry `ListVersionsAsync()` when recently-created versions are expected.
 
+> Example Test
+> Make a Script in ServerScriptService, place PersonaStore under it, then copy/paste this code.
+> ```lua
+>-- Manual/integration test harness for PersonaStore.
+-- Run in Studio with "Enable Studio Access to API Services" turned on, against a
+-- throwaway/staging place. Every store/key is suffixed with a run ID so repeated
+-- runs don't collide with leftover data.
+--
+-- This is NOT a unit test suite (DataStoreService can't be meaningfully mocked
+-- without rewriting the module against an injected interface) -- it's a scripted
+-- sequence of real calls with assertions, meant to be run manually in Studio and
+-- read from the Output window.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- path.to.module
+local PersonaStore = require(script.PersonaStore)
+
+local runId = tostring(os.time())
+
+local results = {Passed = 0,
+	Failed = 0
+}
+
+local function check(description: string, condition: boolean, extra: string?)
+	if condition then
+		results.Passed += 1
+		print("[Pass] " .. description)
+	else
+		results.Failed += 1
+		warn("[Fail] " .. description .. (extra and (" -> " .. extra) or ""))
+	end
+end
+
+local function runSection(name: string, fn: () -> ())
+	print("\n=== " .. name .. " ===")
+	local ok, err = pcall(fn)
+	if not ok then
+		results.Failed += 1
+		warn("[Fail] Section '" .. name .. "' threw an error -> " .. tostring(err))
+	end
+end
+
+PersonaStore:Init()
+
+--------------------------------------------------------------------------------
+runSection("Basic Save / Load roundtrip", function()
+	local Store = PersonaStore:CreateDataStore("Test_Basic_" .. runId, {
+		Schema = { Coins = 0, Inventory = {} },
+	})
+
+	local key = "player_1"
+	local session = Store:LoadSession(key)
+	check("LoadSession returns a session", session ~= nil)
+
+	session.Data.Coins = 500
+	local saveOk = session:Save()
+	check("Save() succeeds", saveOk == true)
+
+	session:Release()
+
+	local snapshot = Store:LoadReadOnlySnapshot(key)
+	check("Read-only snapshot reflects saved value", snapshot ~= nil and snapshot.Data.Coins == 500,
+		snapshot and ("Coins = " .. tostring(snapshot.Data.Coins)) or "snapshot was nil")
+end)
+
+--------------------------------------------------------------------------------
+runSection("SavePatch only writes dirty fields", function()
+	local Store = PersonaStore:CreateDataStore("Test_Patch_" .. runId, {
+		Schema = { Coins = 0, Inventory = { Sword = false } },
+	})
+
+	local key = "player_2"
+	local session = Store:LoadSession(key)
+
+	session.Data.Coins = 100
+	session.Data.Inventory = { Sword = true }
+	session:Save()
+
+	-- Now only touch Coins; Inventory should be left alone by SavePatch
+	session.Data.Coins = 150
+	local patchOk = session:SavePatch()
+	check("SavePatch() succeeds", patchOk == true)
+
+	session:Release()
+
+	local snapshot = Store:LoadReadOnlySnapshot(key)
+
+	print(snapshot.FieldHashes)
+	print(snapshot.FieldHashes and next(snapshot.FieldHashes))
+	
+	check("Patched field updated", snapshot.Data.Coins == 150)
+	check("Untouched field preserved", snapshot.Data.Inventory.Sword == true)
+end)
+
+--------------------------------------------------------------------------------
+runSection("Compression + algorithm-mismatch bug fix", function()
+	local Store = PersonaStore:CreateDataStore("Test_Compression_" .. runId, {
+		Schema = { Coins = 0, Inventory = {} },
+	})
+
+	local key = "player_3"
+	
+	local session = Store:LoadSession(key)
+	
+	session.Data.Coins = 777
+	session.Data.Inventory = {
+		Potion = 3
+	}
+
+	session:SaveCompressed()
+	session:Release()
+
+	local session2 = Store:LoadSession(key)
+
+	check(
+		"Compressed profile loads correctly",
+		session2
+			and session2.Data.Coins == 777
+			and session2.Data.Inventory.Potion == 3
+	)
+
+	session2:Release()
+end)
+
+--------------------------------------------------------------------------------
+runSection("VerifyDataIntegrity bug fix (Full mode)", function()
+	PersonaStore:SetIntegrityMode("Full")
+
+	local Store = PersonaStore:CreateDataStore("Test_Integrity_Full_" .. runId, {
+		Schema = { Coins = 0 },
+	})
+
+	local key = "player_4"
+	local session = Store:LoadSession(key)
+	session.Data.Coins = 42
+	session:Save()
+
+	-- Pre-fix, this reliably returned false even with untampered data.
+	check("VerifyDataIntegrity() returns true for untampered data", session:VerifyDataIntegrity() == true)
+
+	session:Release()
+end)
+
+--------------------------------------------------------------------------------
+runSection("PerField integrity mode", function()
+	PersonaStore:SetIntegrityMode("PerField")
+
+	local Store = PersonaStore:CreateDataStore("Test_Integrity_PerField_" .. runId, {
+		Schema = { Coins = 0, Inventory = {} },
+	})
+
+	local key = "player_5"
+	local session = Store:LoadSession(key)
+	session.Data.Coins = 10
+	session.Data.Inventory = { ItemA = true }
+	session:Save() -- establishes baseline DataHash + FieldHashes
+
+	-- Only touch Coins via SavePatch; Inventory's field hash should be untouched.
+	session.Data.Coins = 20
+	session:SavePatch()
+
+	check("VerifyDataIntegrity() (PerField) returns true after a partial patch",
+		session:VerifyDataIntegrity() == true)
+
+	session:Release()
+
+	local meta = Store:GetKeyMetadata(key)
+	check("FieldHashes present in PerField mode", meta ~= nil and meta.Integrity.FieldHashes ~= nil)
+
+	PersonaStore:SetIntegrityMode("Full")
+end)
+
+--------------------------------------------------------------------------------
+runSection("BatchUpdate double-save bug fix", function()
+	local Store = PersonaStore:CreateDataStore("Test_Batch_" .. runId, {
+		Schema = { Coins = 0 },
+	})
+
+	local keys = { "batch_1", "batch_2" }
+
+	local results1 = Store:BatchUpdate(keys, function(data)
+		data.Coins = 5
+	end)
+	check("BatchUpdate reports success for all keys",
+		results1["batch_1"] == true and results1["batch_2"] == true)
+
+	local meta = Store:GetKeyMetadata("batch_1")
+	-- A brand-new key starts at Version 0; BatchUpdate should bump it to exactly 1
+	-- via a single Destroy() -> Save(). Pre-fix, this would be 2 (SavePatch + Save).
+	check(
+		"Revision incremented exactly once",
+		meta.Revision == 1,
+		"Revision = " .. tostring(meta.Revision)
+	)
+end)
+
+--------------------------------------------------------------------------------
+runSection("OrderedDataStore wrapper", function()
+	local Leaderboard = PersonaStore:CreateOrderedDataStore("Test_Ordered_" .. runId)
+
+	local setOk = Leaderboard:Set("player_1", 100)
+	check("Set() succeeds", setOk == true)
+
+	local value = Leaderboard:Get("player_1")
+	check("Get() returns the set value", value == 100)
+
+	local newValue = Leaderboard:Increment("player_1", 25)
+	check("Increment() returns updated value", newValue == 125)
+
+	Leaderboard:Set("player_2", 50)
+	local page, pages = Leaderboard:GetSortedPage(false, 10)
+	check("GetSortedPage() returns entries", page ~= nil and #page >= 2, pages and "pages returned" or "pages was nil")
+
+	Leaderboard:Remove("player_1")
+	check("Remove() clears the value", Leaderboard:Get("player_1") == nil)
+end)
+
+--------------------------------------------------------------------------------
+runSection("MemoryStore queue wrapper", function()
+	local Queue = PersonaStore:CreateMemoryQueue("Test_Queue_" .. runId)
+
+	local addOk = Queue:AddItem({ Hello = "World" }, 60)
+	check("AddItem() succeeds", addOk == true)
+
+	local items, receiptId = Queue:ReadItems(1, false, 5)
+	check("ReadItems() returns the item", items ~= nil and #items == 1 and receiptId ~= nil)
+
+	if receiptId then
+		local removeOk = Queue:RemoveItems(receiptId)
+		check("RemoveItems() succeeds", removeOk == true)
+	end
+end)
+
+--------------------------------------------------------------------------------
+runSection("MemoryStore sorted map wrapper", function()
+	local ActiveMatches = PersonaStore:CreateMemorySortedMap("Test_SortedMap_" .. runId)
+
+	ActiveMatches:Set("match_1", { Players = 2 }, 60)
+	local match = ActiveMatches:Get("match_1")
+	check("Set()/Get() roundtrip", match ~= nil and match.Players == 2)
+
+	ActiveMatches:Update("match_1", function(old)
+		old.Players += 1
+		return old
+	end)
+	check("Update() applies transform", ActiveMatches:Get("match_1").Players == 3)
+
+	ActiveMatches:Remove("match_1")
+	check("Remove() clears the entry", ActiveMatches:Get("match_1") == nil)
+end)
+
+--------------------------------------------------------------------------------
+runSection("Version APIs", function()
+	local Store = PersonaStore:CreateDataStore("Test_Versions_" .. runId, {
+		Schema = { Coins = 0 },
+	})
+
+	local key = "player_versions"
+
+	local s1 = Store:LoadSession(key)
+	s1.Data.Coins = 1
+	s1:Save()
+
+	s1:Release()
+
+	local s2 = Store:LoadSession(key)
+	s2.Data.Coins = 2
+	s2:Save()
+	
+	local pages
+
+	for i = 1, 12 do
+		pages = Store:ListVersionsAsync(key, Enum.SortDirection.Descending)
+
+		local count = #pages:GetCurrentPage()
+
+		if count >= 2 then
+			break
+		end
+
+		task.wait(5)
+	end
+
+	check(
+		"At least 2 versions exist",
+		pages ~= nil and #pages:GetCurrentPage() >= 2,
+		"found " .. (#pages:GetCurrentPage())
+	)
+
+	if pages then
+		local currentPage = pages:GetCurrentPage()
+
+		print("Entries:", #currentPage)
+
+		for i, v in ipairs(currentPage) do
+			print(i)
+			print("Version:", v.Version)
+			print("CreatedTime:", v.CreatedTime)
+			print("IsDeleted:", v.IsDeleted)
+		end
+
+		if #currentPage >= 2 then
+			local olderVersion = currentPage[2].Version -- second-most-recent
+			local olderData = Store:GetVersionAsync(key, olderVersion)
+			check("GetVersionAsync() returns the older Coins value",
+				olderData ~= nil and olderData.Data.Coins == 1,
+				olderData and ("Coins=" .. tostring(olderData.Data.Coins)) or "olderData was nil")
+
+			local removeOk = Store:RemoveVersionAsync(key, olderVersion)
+			check("RemoveVersionAsync() succeeds", removeOk == true)
+		end
+	end
+end)
+
+--------------------------------------------------------------------------------
+--// NOTE: This test will ALWAYS get 23/24 passes in a studio session
+--// This is because of delay when running 'Store:ListVersionsAsync(key)'
+-- // as Roblox's version history endpoint is not guaranteed to be
+--// immediately consistent after writes.
+print(("\n=== Results: %d Passed, %d Failed ==="):format(results.Passed, results.Failed))
+	-- === Results: 23 passed, 1 failed ===  -  Server - DataManager:319
+> ```
+
 ---
 
 ### Migration Notes for v1.1.0 → v1.2.0
