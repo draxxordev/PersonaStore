@@ -196,10 +196,9 @@ so developers can spend more time building games rather than persistence infrast
 
 ---
 
-## Credits
-@Draxxor
+## PersonaStore is built with time, effort, love, and passion.
 
-PersonaStore is built with time, effort, love, and passion.
+--
 
 **Author:** @Draxxor
 **Version:** 1.2.0
