@@ -196,12 +196,13 @@ so developers can spend more time building games rather than persistence infrast
 
 ---
 
-# License
+## Credits
+@Draxxor
 
-# [MIT License]
+PersonaStore is built with time, effort, love, and passion.
 
-Open-source for the Roblox Development community.
+**Author:** @DraxxorDev  
+**Version:** 1.1.0  
+**License:** MIT
 
-I've linked other really good DataStoreService modules as well in the sources folder.
-
-Made with ❤️ by **@DraxxorDev**
+Made for developers by a developer. ❤
