@@ -158,14 +158,3 @@ session:VerifyDataIntegrity()  -- New integrity check
 - **PATCH**: Bug fixes and performance improvements
 
 ---
-
-## Credits
-@Draxxor
-
-PersonaStore is built with time, effort, love, and passion.
-
-**Author:** @DraxxorDev  
-**Version:** 1.1.0  
-**License:** MIT (or your preferred license)
-
-Made for developers by a developer. ❤
