@@ -52,4 +52,4 @@
 ### Can I use this on the client?
 > No. PersonaStore is a **server-only** persistence framework and will throw an error if required from the client.
 
----
+### ---
