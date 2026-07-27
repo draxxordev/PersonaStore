@@ -1,6 +1,6 @@
 # PersonaStore Documentation
 
-PersonaStore is a robust, production-ready DataStore persistence framework with native Roblox EncodingService integration, compression, data integrity verification, and advanced session management.
+PersonaStore is a robust, production-ready DataStore persistence framework with native Roblox EncodingService integration, compression, data integrity verification, and advanced session management. It also wraps OrderedDataStores, MemoryStoreService, and DataStore versioning behind the same retry/backoff layer as the core profile engine.
 
 ## Table of Contents
 
@@ -8,10 +8,14 @@ PersonaStore is a robust, production-ready DataStore persistence framework with 
 2. [Core API Reference](#core-api-reference)
 3. [EncodingService Integration](#encodingservice-integration)
 4. [Compression & Hashing](#compression--hashing)
-5. [Read-Only Access](#read-only-access)
-6. [Batch Operations](#batch-operations)
-7. [Statistics & Monitoring](#statistics--monitoring)
-8. [Advanced Features](#advanced-features)
+5. [Integrity Modes](#integrity-modes)
+6. [Read-Only Access](#read-only-access)
+7. [Batch Operations](#batch-operations)
+8. [OrderedDataStore Support](#ordereddatastore-support)
+9. [MemoryStoreService Support](#memorystoreservice-support)
+10. [DataStore Version APIs](#datastore-version-apis)
+11. [Statistics & Monitoring](#statistics--monitoring)
+12. [Advanced Features](#advanced-features)
 
 ---
 
@@ -41,6 +45,13 @@ Configure compression settings globally:
 PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 9)
 ```
 
+Configure how much a `SavePatch()` hash pass costs (see [Integrity Modes](#integrity-modes) below):
+
+```lua
+-- Only rehash fields that actually changed, instead of the whole profile
+PersonaStore:SetIntegrityMode("PerField")
+```
+
 Load and interact with sessions:
 
 ```lua
@@ -58,7 +69,7 @@ end
 
 ### PersonaStore
 
-The engine singleton that manages all DataStores, compression, and cluster communication.
+The engine singleton that manages all DataStores, OrderedDataStores, MemoryStores, compression, and cluster communication.
 
 #### PersonaStore:Init()
 
@@ -114,6 +125,45 @@ PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 9)
 - **Deflate, Level 6**: Good balance of speed and compression (default)
 - **ZSTD, Level 9**: Best for data-heavy profiles (slower but ~20-30% better compression)
 - **ZSTD, Level 22**: Maximum compression for archival/exports
+
+> **Note:** The algorithm used is recorded per-profile in `CompressionMetadata.Algorithm`. Changing this setting mid-project is safe — existing compressed profiles are always decompressed with whatever algorithm they were originally saved with, not whatever the current global default is.
+
+---
+
+#### PersonaStore:SetIntegrityMode(mode)
+
+**NEW in v1.2.0** — Controls how much work `SavePatch()` does to keep integrity hashes current. See [Integrity Modes](#integrity-modes) for full details.
+
+```lua
+PersonaStore:SetIntegrityMode("PerField")
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `mode` | `string` | One of `"Full"`, `"HashOnlyOnFullSave"`, `"PerField"` |
+
+Invalid modes are ignored (with a `warn()`), leaving the current mode unchanged.
+
+---
+
+#### PersonaStore:CreateOrderedDataStore(storeName)
+
+**NEW in v1.2.0** — Creates or returns an existing `OrderedFounder`, a thin wrapper over `DataStoreService:GetOrderedDataStore()`. See [OrderedDataStore Support](#ordereddatastore-support).
+
+```lua
+local Leaderboard = PersonaStore:CreateOrderedDataStore("WeeklyLeaderboard_v1")
+```
+
+---
+
+#### PersonaStore:CreateMemoryQueue(name) / PersonaStore:CreateMemorySortedMap(name)
+
+**NEW in v1.2.0** — Creates or returns cached wrappers over `MemoryStoreService` queues and sorted maps. See [MemoryStoreService Support](#memorystoreservice-support).
+
+```lua
+local PurchaseQueue = PersonaStore:CreateMemoryQueue("PendingPurchases")
+local ActiveMatches = PersonaStore:CreateMemorySortedMap("ActiveMatches")
+```
 
 ---
 
@@ -185,7 +235,7 @@ local session = Store:LoadSessionAsync(tostring(player.UserId), 8)
 
 #### Founder:LoadReadOnlySession(key)
 
-**NEW** - Loads profile data without acquiring a lock (read-only, no mutations).
+Loads profile data without acquiring a lock (read-only, no mutations).
 
 ```lua
 local readOnlyData = Store:LoadReadOnlySession(tostring(userId))
@@ -199,7 +249,7 @@ end
 |-----------|------|----------|-------------|
 | `key` | `string` | Yes | Profile key |
 
-**Returns:** `table?` — The profile data, or `nil` if not found
+**Returns:** `table?` — The profile data, or `nil` if not found. Compressed profiles are transparently decompressed before being returned.
 
 **Use cases:**
 - Leaderboard queries without locking the player
@@ -236,7 +286,7 @@ PlayerStore:PublishGlobalUpdate(tostring(userId), {
 
 #### Founder:BatchUpdate(keys, transformFn)
 
-**NEW** - Atomically updates multiple profiles with a transformation function.
+Atomically updates multiple profiles with a transformation function.
 
 ```lua
 local results = PlayerStore:BatchUpdate({userId1, userId2, userId3}, function(data)
@@ -258,13 +308,13 @@ end
 
 **Returns:** `{[string]: boolean}` — Success status per key
 
-**Important:** `BatchUpdate` will wait up to 5 seconds per key. Avoid with very large arrays.
+**Important:** `BatchUpdate` will wait up to 5 seconds per key. Avoid with very large arrays. Each key is written to the DataStore exactly once (a full `Save()` via `Destroy()`), regardless of the outcome of `transformFn`.
 
 ---
 
 #### Founder:GetKeyMetadata(key)
 
-**NEW** - Retrieves metadata about a profile without loading it.
+Retrieves metadata about a profile without loading it.
 
 ```lua
 local meta = Store:GetKeyMetadata(tostring(userId))
@@ -285,14 +335,15 @@ end
 | `LastUpdate` | `number` | Unix timestamp of last save |
 | `SessionToken` | `string?` | Current session token if locked |
 | `JobId` | `string?` | Server JobId currently owning the lock |
-| `DataHash` | `string?` | SHA256 hash of profile data (if enabled) |
+| `DataHash` | `string?` | SHA256 hash of the whole profile (if enabled; may be stale in `"PerField"` mode until the next full `Save()`) |
+| `FieldHashes` | `table?` | Per-field SHA256 hashes (if enabled) |
 | `CompressionMetadata` | `table?` | Compression info |
 
 ---
 
 #### Founder:GetCompressionStats()
 
-**NEW** - Returns compression statistics for this store.
+Returns compression statistics for this store.
 
 ```lua
 local stats = Store:GetCompressionStats()
@@ -309,6 +360,24 @@ Returns the number of currently loaded sessions on this server.
 local count = Store:GetActiveSessionCount()
 print("Active sessions:", count)
 ```
+
+---
+
+#### Founder:ListVersionsAsync(key, sortDirection, minDate, maxDate, pageSize)
+
+**NEW in v1.2.0** — See [DataStore Version APIs](#datastore-version-apis).
+
+---
+
+#### Founder:GetVersionAsync(key, version)
+
+**NEW in v1.2.0** — See [DataStore Version APIs](#datastore-version-apis).
+
+---
+
+#### Founder:RemoveVersionAsync(key, version)
+
+**NEW in v1.2.0** — See [DataStore Version APIs](#datastore-version-apis).
 
 ---
 
@@ -343,6 +412,7 @@ local success = session:Save()
 **Notes:**
 - Costs more bandwidth than `SavePatch()`
 - Confirms lock token before writing
+- Recomputes both the whole-profile `DataHash` and the per-field `FieldHashes` table, regardless of the current `IntegrityMode` — a full save always re-establishes a clean baseline
 - Use for important checkpoints
 
 ---
@@ -361,12 +431,13 @@ session:SavePatch()
 - This is what the autosave heartbeat calls
 - Dramatically reduces bandwidth on large profiles
 - Prefer over `Save()` for routine autosaving
+- The cost of the integrity hash pass depends on `PersonaStore.IntegrityMode` — see [Integrity Modes](#integrity-modes)
 
 ---
 
 #### DataSession:SaveCompressed()
 
-**NEW** - Saves the entire profile with EncodingService compression.
+Saves the entire profile with EncodingService compression.
 
 ```lua
 local success = session:SaveCompressed()
@@ -428,7 +499,7 @@ local success = session:RollbackTransaction()
 
 #### DataSession:IncrementCounter(fieldName, amount)
 
-**NEW** - Atomically increments a counter in the data.
+Atomically increments a counter in the data.
 
 ```lua
 session:IncrementCounter("Coins", 100)  -- Coins += 100
@@ -451,7 +522,7 @@ session:IncrementCounter("Level")       -- Level += 1
 
 #### DataSession:ExportData(includeMetadata)
 
-**NEW** - Exports profile data as JSON string for backup/migration.
+Exports profile data as JSON string for backup/migration.
 
 ```lua
 local json = session:ExportData(true)
@@ -479,7 +550,7 @@ local json = session:ExportData(true)
 
 #### DataSession:ImportData(jsonString, overwrite)
 
-**NEW** - Imports profile data from a JSON export.
+Imports profile data from a JSON export.
 
 ```lua
 local success = session:ImportData(jsonString, false)  -- Merge mode
@@ -498,7 +569,7 @@ local success = session:ImportData(jsonString, true)   -- Overwrite mode
 
 #### DataSession:VerifyDataIntegrity()
 
-**NEW** - Verifies profile data integrity using stored hash.
+Verifies profile data integrity using stored hash(es).
 
 ```lua
 if not session:VerifyDataIntegrity() then
@@ -507,9 +578,13 @@ if not session:VerifyDataIntegrity() then
 end
 ```
 
-**Returns:** `boolean` — Whether data hash matches
+**Returns:** `boolean` — Whether the stored hash(es) match the current in-memory data
 
 **Requires:** `PersonaStore.EnableDataIntegrityChecks = true` (enabled by default)
+
+**Behavior depends on `IntegrityMode`:**
+- `"Full"` / `"HashOnlyOnFullSave"` — compares against the whole-profile `DataHash`.
+- `"PerField"` — compares each field in memory against its corresponding entry in `FieldHashes`.
 
 ---
 
@@ -677,13 +752,16 @@ The `CompressionHandler` is an internal utility managing all encoding operations
 - **9+:** Better compression, slower (use for end-of-session saves)
 - **20-22:** Maximum compression (use for archives/exports)
 
+Each compressed profile records the exact algorithm it was compressed with in `CompressionMetadata.Algorithm`, so decompression is always correct even if you later call `SetCompressionSettings()` with a different algorithm.
+
 ### Hash Verification
 
 When `PersonaStore.EnableDataIntegrityChecks = true` (default):
 
-- Every `Save()` computes a SHA256 hash of the profile data
-- The hash is stored with the profile
-- `session:VerifyDataIntegrity()` checks if cloud hash matches in-memory hash
+- `Save()` computes both a whole-profile `DataHash` and a per-field `FieldHashes` table
+- `SavePatch()` refreshes hashes according to the current `IntegrityMode`
+- The hash(es) are stored with the profile
+- `session:VerifyDataIntegrity()` checks whether the stored hash(es) match the in-memory data
 
 **Hash Algorithms Supported:**
 
@@ -701,6 +779,27 @@ local compressed = CompressionHandler.compress(profileData)
 local base64 = CompressionHandler.encodeToBase64(compressed)
 -- Stored as JSON-safe string in DataStore
 ```
+
+---
+
+## Integrity Modes
+
+**NEW in v1.2.0.** `SavePatch()` used to rehash the *entire* profile on every call, even if only one small field changed. That's expensive once a profile has large, mostly-static fields (a 50,000-item `Inventory`, for example) sitting next to something that changes constantly (`Coins`). `PersonaStore.IntegrityMode` lets you trade off hashing cost against how fine-grained your integrity checks are.
+
+| Mode | `SavePatch()` cost | What gets checked | Notes |
+|------|--------------------|--------------------|-------|
+| `"Full"` *(default)* | Rehashes the whole profile every patch | Whole-profile `DataHash` | Same behavior as v1.1.x; safest, but scales with total profile size, not with what changed |
+| `"HashOnlyOnFullSave"` | No hashing at all | Whole-profile `DataHash`, but only current as of the last full `Save()` | Cheapest option; use if you only need integrity guarantees at checkpoints, not on every autosave |
+| `"PerField"` | Rehashes only the fields in this patch | Per-field `FieldHashes` | Best of both worlds for profiles with large static fields next to frequently-changing ones |
+
+```lua
+-- Only rehash the fields that actually changed on each SavePatch()
+PersonaStore:SetIntegrityMode("PerField")
+```
+
+`DataSession:VerifyDataIntegrity()` automatically checks the right structure (`DataHash` or `FieldHashes`) for whichever mode is active. `Save()` (the full save) always refreshes both `DataHash` and `FieldHashes` regardless of mode, so switching modes mid-project — or falling back from `"PerField"` to `"Full"` — is safe as long as a full `Save()` has run at least once since the switch.
+
+**Important caveat:** in `"PerField"` and `"HashOnlyOnFullSave"` modes, the whole-profile `DataHash` returned by `Founder:GetKeyMetadata()` can go stale between full saves. Don't treat it as a live whole-profile checksum in those modes — use `VerifyDataIntegrity()`, which knows which structure to trust.
 
 ---
 
@@ -729,6 +828,8 @@ end
 - Instant reads
 - Perfect for queries and reporting
 
+For true leaderboards with efficient range queries (top N, rank lookups), consider [OrderedDataStore Support](#ordereddatastore-support) instead — it's purpose-built for sorted numeric reads and doesn't require loading/decompressing full profile documents.
+
 ---
 
 ## Batch Operations
@@ -747,7 +848,143 @@ end)
 print("Successfully updated:", #(results or {}))
 ```
 
-Each profile is locked individually, modified, and saved. If a lock fails, that key's result is `false`.
+Each profile is locked individually, modified, and saved exactly once (a full `Save()`, via `Destroy()`). If a lock fails, that key's result is `false`.
+
+---
+
+## OrderedDataStore Support
+
+**NEW in v1.2.0.** `OrderedFounder` wraps `DataStoreService:GetOrderedDataStore()` for cases where you just need a sorted, numeric leaderboard — no session locks, schemas, or compression, since OrderedDataStores only ever store non-negative integers.
+
+```lua
+local Leaderboard = PersonaStore:CreateOrderedDataStore("WeeklyLeaderboard_v1")
+
+-- Set an explicit score
+Leaderboard:Set(tostring(player.UserId), 4200)
+
+-- Read it back
+local score = Leaderboard:Get(tostring(player.UserId))
+
+-- Atomically bump it
+Leaderboard:Increment(tostring(player.UserId), 50)
+
+-- Remove an entry entirely
+Leaderboard:Remove(tostring(player.UserId))
+
+-- Read a sorted page (top 50, descending)
+local topPage, pages = Leaderboard:GetSortedPage(false, 50)
+for _, entry in ipairs(topPage) do
+    print(entry.key, entry.value)
+end
+
+-- Keep paging with the native DataStorePages object
+if not pages.IsFinished then
+    pages:AdvanceToNextPageAsync()
+end
+```
+
+| Method | Description |
+|--------|-------------|
+| `Set(key, value)` | Sets an explicit non-negative integer value |
+| `Get(key)` | Reads the current value, or `nil` |
+| `Increment(key, delta?)` | Atomically adds `delta` (default `1`), returns the new value |
+| `Remove(key)` | Deletes the key |
+| `GetSortedPage(ascending?, pageSize?, minValue?, maxValue?)` | Returns `(currentPage, pages)` — a plain array of `{key, value}` entries plus the native `DataStorePages` object for further pagination |
+
+---
+
+## MemoryStoreService Support
+
+**NEW in v1.2.0.** For short-lived, high-throughput, ephemeral data that doesn't need DataStore durability — matchmaking queues, purchase-processing jobs, active-match tracking — PersonaStore wraps `MemoryStoreService` queues and sorted maps with the same retry/backoff behavior as everything else.
+
+### MemoryQueueWrapper
+
+```lua
+local PurchaseQueue = PersonaStore:CreateMemoryQueue("PendingPurchases")
+
+-- Add a job, expiring after 1 hour if never read
+PurchaseQueue:AddItem({ UserId = player.UserId, ProductId = 123 }, 3600)
+
+-- Read up to 5 items, waiting up to 5 seconds for something to arrive
+local items, receiptId = PurchaseQueue:ReadItems(5, false, 5)
+if items then
+    for _, item in ipairs(items) do
+        -- process item...
+    end
+    -- Only remove once processing succeeded
+    PurchaseQueue:RemoveItems(receiptId)
+end
+```
+
+| Method | Description |
+|--------|-------------|
+| `AddItem(value, expirationSeconds?, priority?)` | Adds an item to the queue (default expiration: 1 hour) |
+| `ReadItems(count?, allOrNothing?, waitTimeoutSeconds?)` | Returns `(items, receiptId)`, or `(nil, nil)` on failure |
+| `RemoveItems(receiptId)` | Removes a previously-read batch using its receipt ID |
+
+### MemorySortedMapWrapper
+
+```lua
+local ActiveMatches = PersonaStore:CreateMemorySortedMap("ActiveMatches")
+
+ActiveMatches:Set(matchId, { Players = {...}, StartedAt = os.time() }, 1800)
+
+local match = ActiveMatches:Get(matchId)
+
+ActiveMatches:Remove(matchId)
+
+local recentMatches = ActiveMatches:GetRange(Enum.SortDirection.Descending, 20)
+
+ActiveMatches:Update(matchId, function(oldValue)
+    oldValue.Players = oldValue.Players or {}
+    table.insert(oldValue.Players, newPlayerId)
+    return oldValue
+end)
+```
+
+| Method | Description |
+|--------|-------------|
+| `Set(key, value, expirationSeconds?, sortKey?)` | Sets a key's value (default expiration: 1 hour) |
+| `Get(key)` | Returns the value, or `nil` |
+| `Remove(key)` | Deletes the key |
+| `GetRange(direction?, count?, exclusiveLowerBound?, exclusiveUpperBound?)` | Returns a sorted array of entries |
+| `Update(key, transformFn, expirationSeconds?)` | Atomically transforms a key's value |
+
+---
+
+## DataStore Version APIs
+
+**NEW in v1.2.0.** Thin, retry-wrapped access to Roblox's native DataStore version history, exposed on `Founder`.
+
+```lua
+-- List recent historical versions of a key
+local pages = PlayerStore:ListVersionsAsync(tostring(userId), Enum.SortDirection.Descending)
+if pages then
+    for _, versionInfo in ipairs(pages:GetCurrentPage()) do
+        print(versionInfo.Version, os.date("%c", versionInfo.CreatedTime / 1000))
+    end
+end
+
+-- Fetch a specific historical version (auto-decompressed if it was stored compressed)
+local oldSnapshot = PlayerStore:GetVersionAsync(tostring(userId), someVersionId)
+if oldSnapshot then
+    print("Coins at that version:", oldSnapshot.Data.Coins)
+end
+
+-- Permanently delete a specific historical version
+PlayerStore:RemoveVersionAsync(tostring(userId), someVersionId)
+```
+
+| Method | Description |
+|--------|-------------|
+| `ListVersionsAsync(key, sortDirection?, minDate?, maxDate?, pageSize?)` | Returns the native `DataStoreVersionPages` object, or `nil` on failure |
+| `GetVersionAsync(key, version)` | Returns a deep copy of that historical version's raw record (with `Data` decompressed if needed), or `nil` |
+| `RemoveVersionAsync(key, version)` | Permanently removes a historical version. **This cannot be undone.** Returns `boolean` |
+
+**Best for:**
+- Investigating support tickets ("what did this player's inventory look like yesterday?")
+- Manual rollback tooling for corrupted or disputed profiles
+- Compliance/audit requirements around historical data retention
 
 ---
 
@@ -759,10 +996,10 @@ Monitor server health and performance:
 -- Create a monitoring loop
 while true do
     task.wait(300)  -- Every 5 minutes
-    
+
     local stats = PersonaStore:GetStatistics()
     local playerStore = PersonaStore.RegisteredStores["PlayerData"]
-    
+
     print("=== Engine Statistics ===")
     print("Active sessions:", playerStore:GetActiveSessionCount())
     print("Total loads:", stats.TotalLoads)
@@ -828,6 +1065,17 @@ else
 end
 ```
 
+### Cheap Patch Hashing for Large Profiles
+
+For profiles with large, mostly-static fields (deep inventories, achievement logs) sitting next to frequently-changing ones (currency, XP), switch to per-field hashing so routine autosaves don't pay to rehash data that didn't change:
+
+```lua
+PersonaStore:SetIntegrityMode("PerField")
+
+session:StartAutoSave(15)
+-- Every autosave now only rehashes whichever top-level fields were actually dirtied
+```
+
 ---
 
 ## Best Practices
@@ -835,11 +1083,13 @@ end
 1. **Always initialize:** Call `PersonaStore:Init()` once at server start
 2. **Use `SavePatch()` by default:** Significantly reduces bandwidth for most use cases
 3. **Enable integrity checks:** `PersonaStore.EnableDataIntegrityChecks = true` catches data corruption
-4. **Use compression strategically:** `SaveCompressed()` for large profiles, important checkpoints
-5. **Read-only for queries:** Use `LoadReadOnlySession()` for leaderboards, admin panels
-6. **Clean up sessions:** Always call `Destroy()` on player leave
-7. **Monitor statistics:** Track engine health with `GetStatistics()`
-8. **Configure compression:** Tune compression algorithm and level per your data size
+4. **Pick the right `IntegrityMode`:** `"Full"` if you want the strongest guarantees on every patch; `"PerField"` if you have large static fields next to frequently-changing ones; `"HashOnlyOnFullSave"` if you only need integrity checks at checkpoints
+5. **Use compression strategically:** `SaveCompressed()` for large profiles, important checkpoints
+6. **Read-only for queries:** Use `LoadReadOnlySession()` for ad-hoc profile lookups; use `OrderedDataStore` for true sorted leaderboards
+7. **Clean up sessions:** Always call `Destroy()` on player leave
+8. **Monitor statistics:** Track engine health with `GetStatistics()`
+9. **Configure compression:** Tune compression algorithm and level per your data size
+10. **Reach for MemoryStore for ephemeral data:** Don't put short-lived queue/job data in a DataStore-backed profile — use `CreateMemoryQueue`/`CreateMemorySortedMap` instead
 
 ---
 
@@ -850,6 +1100,7 @@ local PersonaStore = require(ServerStorage.PersonaStore)
 
 -- Configure engine
 PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 6)
+PersonaStore:SetIntegrityMode("PerField")
 PersonaStore:Init()
 
 -- Create stores
@@ -863,29 +1114,32 @@ local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v2", {
     AutoSaveInterval = 30
 })
 
+local Leaderboard = PersonaStore:CreateOrderedDataStore("WeeklyLeaderboard_v1")
+
 -- On player join
 Players.PlayerAdded:Connect(function(player)
     local session = PlayerStore:LoadSessionAsync(tostring(player.UserId), 10)
-    
+
     if not session then
         player:Kick("Failed to load data. Please rejoin.")
         return
     end
-    
+
     -- Listen for changes
     session:ListenToFieldChange(function(key, value, rootKey)
         if rootKey == "Coins" then
             player.leaderstats.Coins.Value = session.Data.Coins
+            Leaderboard:Set(tostring(player.UserId), session.Data.Coins)
         end
     end)
-    
+
     -- Process queued global updates
     for _, update in session:ConsumeGlobalUpdates() do
         if update.Type == "Currency" then
             session.Data.Coins += update.Amount
         end
     end
-    
+
     player:SetAttribute("Session", session)
 end)
 
@@ -900,7 +1154,7 @@ end)
 -- Periodic monitoring
 while true do
     task.wait(300)
-    
+
     local stats = PersonaStore:GetStatistics()
     print("Active sessions:", PlayerStore:GetActiveSessionCount())
     print("Total saves:", stats.TotalSaves)
@@ -919,8 +1173,9 @@ PersonaStore.CompressionAlgorithm = Enum.CompressionAlgorithm.Deflate
 PersonaStore.CompressionLevel = 6
 PersonaStore.EnableDataIntegrityChecks = true
 PersonaStore.HashAlgorithm = Enum.HashAlgorithm.SHA256
+PersonaStore.IntegrityMode = "Full" -- "Full" | "HashOnlyOnFullSave" | "PerField"
 PersonaStore.GlobalLockTimeout = 120  -- seconds
 PersonaStore.GlobalAutoSaveInterval = 30  -- seconds
 ```
 
-All settings can be modified before `Init()` or via `:SetCompressionSettings()`.
+All settings can be modified before `Init()` or via `:SetCompressionSettings()` / `:SetIntegrityMode()`.
