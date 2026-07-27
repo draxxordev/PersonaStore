@@ -193,6 +193,7 @@ local GuildStore = PersonaStore:CreateDataStore("Guilds", {
 - Calling this multiple times with the same `storeName` returns the existing `Founder`; the `configOptions` passed on subsequent calls are ignored.
 - Every `Founder` manages its own active sessions, independently of every other store.
 - One `Founder` corresponds to one Roblox DataStore.
+- `Schema` reconciliation is additive only — every `LoadSession()` fills in any key present in `Schema` but missing from a saved profile, without touching or overwriting keys that already exist. This is what lets a new field be added to `Schema` after a game has already shipped without wiping existing players' data.
 
 ---
 
@@ -220,6 +221,8 @@ local session = Store:LoadSession(key)
 |------|------|----------|-------------|
 | `key` | `string` | Yes | The profile key to load. |
 
+`key` is whatever string identifies this profile in the DataStore. For player data this is almost always `tostring(player.UserId)`, since it's stable across sessions and unique per account. Nothing about `Founder` assumes the key is a player, though — a guild ID, a world name, or a fixed string like `"Leaderboard_Season3"` works exactly the same way.
+
 ---
 
 ### Returns
@@ -246,6 +249,25 @@ local session = Store:LoadSession(key)
 
 ---
 
+### Example
+
+A typical join handler treats a `nil` result as "still owned elsewhere" and kicks the player back to the queue rather than letting them play on an unloaded profile:
+
+```lua
+Players.PlayerAdded:Connect(function(player)
+    local session = PlayerStore:LoadSession(tostring(player.UserId))
+
+    if not session then
+        player:Kick("Your data is still loading. Please rejoin in a few seconds.")
+        return
+    end
+
+    -- session is now safe to read and write
+end)
+```
+
+---
+
 ## Founder:LoadSessionAsync()
 
 Repeatedly attempts to acquire a session, once per second, until successful or the timeout expires.
@@ -265,6 +287,8 @@ local session = Store:LoadSessionAsync(key, maxWait)
 | `key` | `string` | Yes | The profile key to load. |
 | `maxWait` | `number` | No | Maximum seconds to keep retrying. Defaults to `10`. |
 
+`maxWait` caps how long the calling code is willing to wait, not how many attempts are made — internally this polls `LoadSession()` once per second, so `maxWait = 10` means roughly 10 attempts before giving up and returning `nil`.
+
 ---
 
 ### Returns
@@ -279,6 +303,21 @@ local session = Store:LoadSessionAsync(key, maxWait)
 
 - Reconnects shortly after a crash or unexpected disconnect.
 - Any load where a short delay is preferable to an outright failure.
+
+---
+
+### Example
+
+```lua
+Players.PlayerAdded:Connect(function(player)
+    local session = PlayerStore:LoadSessionAsync(tostring(player.UserId), 8)
+
+    if not session then
+        player:Kick("Could not load your data. Please try again shortly.")
+        return
+    end
+end)
+```
 
 ---
 
@@ -300,6 +339,8 @@ Store:PublishGlobalUpdate(key, payload)
 |------|------|----------|-------------|
 | `key` | `string` | Yes | The profile key to target. |
 | `payload` | `table` | Yes | Arbitrary data describing the update. |
+
+`payload` has no required shape — PersonaStore stores and forwards whatever table is passed in. Since the receiving code has to make sense of it later (in `ListenToGlobalUpdate()` or `ConsumeGlobalUpdates()`), it's worth picking a small convention up front, such as always including a `Type` field, so the handler can branch on what kind of update it received.
 
 ---
 
@@ -323,6 +364,22 @@ Store:PublishGlobalUpdate(key, payload)
 
 - The `boolean` return reflects whether the queue write succeeded, independent of whether a locally loaded session also received the update live.
 - A session that is offline when this is called consumes the update the next time it loads, via `ConsumeGlobalUpdates()`.
+
+---
+
+### Example
+
+Sending a purchase from an external system, using a `Type` field as the convention mentioned above:
+
+```lua
+PlayerStore:PublishGlobalUpdate(tostring(userId), {
+    Type = "Currency",
+    Amount = 500,
+    Reason = "WebStorePurchase"
+})
+```
+
+Handling it on the receiving end reads the same `Type` field back out — see `ListenToGlobalUpdate()` and `ConsumeGlobalUpdates()` for the two ways to pick it up.
 
 ---
 
@@ -461,7 +518,7 @@ session:SavePatch()
 
 Takes a deep-copy snapshot of the current `Data` table for later rollback.
 
-Has no effect on what's persisted to the DataStore. `Save()` or `SavePatch()` must still be called separately to persist anything.
+Has no effect on what's persisted to the DataStore. `Save()` or `SavePatch()` must still be called separately to persist anything. These three methods are meant to be used together, as a set, around any multi-step mutation you might need to undo: call `BeginTransaction()` before the risky changes, then either `CommitTransaction()` once you're satisfied they're valid, or `RollbackTransaction()` to put `Data` back exactly how it was.
 
 ```lua
 session:BeginTransaction()
@@ -477,9 +534,37 @@ session:BeginTransaction()
 
 ---
 
+### Example
+
+A shop purchase that deducts currency and grants an item in two separate writes, but needs to undo both if a later validation step fails:
+
+```lua
+local function purchaseItem(session, itemId, cost)
+    session:BeginTransaction()
+
+    session.Data.Coins -= cost
+    session.Data.Inventory[itemId] = true
+
+    local isValid = session.Data.Coins >= 0 -- e.g. guard against a race on cost
+
+    if isValid then
+        session:CommitTransaction()
+        session:SavePatch()
+    else
+        session:RollbackTransaction()
+    end
+
+    return isValid
+end
+```
+
+---
+
 ## DataSession:CommitTransaction()
 
 Discards the snapshot taken by `BeginTransaction()`, keeping the data as it currently stands in memory.
+
+Call this once the changes made since `BeginTransaction()` are confirmed valid. It doesn't persist anything by itself — follow it with `Save()` or `SavePatch()` if the change needs to reach the DataStore. See `BeginTransaction()` for the full pattern.
 
 ```lua
 session:CommitTransaction()
@@ -496,6 +581,8 @@ Nothing.
 ## DataSession:RollbackTransaction()
 
 Restores `Data` to the state captured by the most recent `BeginTransaction()` call, then clears the snapshot.
+
+Call this when a multi-step change turns out to be invalid partway through, instead of manually writing every field back to its old value. See `BeginTransaction()` for the full pattern.
 
 ```lua
 session:RollbackTransaction()
@@ -529,11 +616,20 @@ session:StartAutoSave(interval)
 |------|------|----------|-------------|
 | `interval` | `number` | Yes | Seconds between automatic patch saves. |
 
+Shorter intervals keep the cloud copy of `Data` fresher at the cost of more frequent DataStore requests. Longer intervals cut request volume but widen the window of changes that only exist in memory. This is orthogonal to `BindToClose` safety — `Destroy()` always performs a full `Save()` on shutdown regardless of the configured interval, so the tradeoff here is really about how current the cloud copy stays during normal play (relevant to things like `IsCacheStale()` checks from another server).
+
 ---
 
 ### Returns
 
 Nothing.
+
+---
+
+### Notes
+
+- Called automatically inside `LoadSession()` using the store's `AutoSaveInterval` config, so most code never touches this directly.
+- Calling it again restarts the loop at the new interval — useful for temporarily tightening the save cadence around a high-stakes moment, such as right before a trade, then calling it again afterward to restore the default.
 
 ---
 
@@ -581,6 +677,22 @@ local stale = session:IsCacheStale()
 
 ---
 
+### Example
+
+```lua
+local function confirmTrade(session)
+    if session:IsCacheStale() then
+        warn("Profile was modified elsewhere, refusing to trust in-memory data.")
+        return false
+    end
+
+    -- safe to proceed using session.Data as-is
+    return true
+end
+```
+
+---
+
 ## DataSession:ConsumeGlobalUpdates()
 
 Returns every global update currently queued in memory for this session and clears the queue.
@@ -597,7 +709,32 @@ local updates = session:ConsumeGlobalUpdates()
 
 | Type | Description |
 |------|-------------|
-| `{table}` | The queued updates, in the order they were received. |
+| `{table}` | The queued updates, in the order they were received. Each entry is exactly the `payload` table that was passed into `PublishGlobalUpdate()`. |
+
+---
+
+### Best Uses
+
+- Right after `LoadSession()` returns, to process anything that arrived while the player was offline.
+- Batch-processing several pending updates at once, rather than reacting to each one individually as it streams in through `ListenToGlobalUpdate()`.
+
+---
+
+### Example
+
+Using the `Type` convention introduced in `PublishGlobalUpdate()`:
+
+```lua
+local session = PlayerStore:LoadSession(tostring(player.UserId))
+
+for _, update in session:ConsumeGlobalUpdates() do
+    if update.Type == "Currency" then
+        session.Data.Coins += update.Amount
+    elseif update.Type == "Item" then
+        session.Data.Inventory[update.ItemId] = true
+    end
+end
+```
 
 ---
 
@@ -619,6 +756,8 @@ end)
 |------|------|----------|-------------|
 | `callback` | `(payload: table) -> ()` | Yes | Invoked once per incoming live update. |
 
+`payload` is the exact same table passed into `PublishGlobalUpdate()` on whichever server sent it — this callback exists to react immediately (a notification, a UI popup), while `ConsumeGlobalUpdates()` exists to actually apply the change to `Data`. Most setups use both: this callback for instant feedback, and a call to `ConsumeGlobalUpdates()` inside (or shortly after) it to commit the change.
+
 ---
 
 ### Returns
@@ -633,9 +772,32 @@ Nothing.
 
 ---
 
+### Example
+
+```lua
+session:ListenToGlobalUpdate(function(payload)
+    if payload.Type == "Currency" then
+        StarterGui:SetCore("SendNotification", {
+            Title = "Gift Received",
+            Text = "+" .. payload.Amount .. " coins"
+        })
+    end
+
+    for _, update in session:ConsumeGlobalUpdates() do
+        if update.Type == "Currency" then
+            session.Data.Coins += update.Amount
+        end
+    end
+end)
+```
+
+---
+
 ## DataSession:ListenToFieldChange()
 
 Fires whenever any field in `Data` changes, at any nesting depth.
+
+Every write, including one buried several tables deep, passes through the same observable proxy, so this single listener is enough to react to changes anywhere in the profile — there's no need to attach separate listeners per nested table.
 
 ```lua
 session:ListenToFieldChange(function(key, value, rootKey)
@@ -649,13 +811,55 @@ end)
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `callback` | `(key: string, value: any, rootKey: string) -> ()` | Yes | Invoked on every mutation. `rootKey` is the top-level field the change is tracked under, regardless of how deep the actual write occurred. |
+| `callback` | `(key: string, value: any, rootKey: string) -> ()` | Yes | Invoked on every mutation, at any depth. |
+
+The three callback arguments answer three different questions about the same write:
+
+| Argument | Meaning |
+|----------|---------|
+| `key` | The literal key that was assigned to — whatever sits immediately to the left of `=` in the write that triggered this. |
+| `value` | The new value that was assigned. |
+| `rootKey` | The top-level field under `Data` that this write lives under, no matter how deeply nested the actual write was. This is the same name `SavePatch()` uses internally to decide what's dirty, so it's the reliable one to branch on. |
+
+`key` and `rootKey` are only ever different when the write happens below the top level. Two examples make the distinction concrete:
+
+```lua
+session.Data.Coins = 150
+-- key = "Coins", value = 150, rootKey = "Coins"
+
+session.Data.Inventory.Weapons.Sword.Enchants.Fire = true
+-- key = "Fire", value = true, rootKey = "Inventory"
+```
+
+In the second case, `key` only tells you the innermost field name (`"Fire"`), which isn't unique on its own — plenty of tables could have a `Fire` key. `rootKey` is what reliably tells you *which top-level system* changed (`"Inventory"`), which is almost always what a listener actually cares about.
 
 ---
 
 ### Returns
 
 Nothing.
+
+---
+
+### Best Uses
+
+- Syncing a leaderstat or BillboardGui the instant the underlying value changes, without waiting for a save.
+- Driving client-facing UI updates off the same writes that already mark data dirty for `SavePatch()`.
+- Lightweight debug logging of what's about to go into the next patch save.
+
+---
+
+### Example
+
+```lua
+session:ListenToFieldChange(function(key, value, rootKey)
+    if rootKey == "Coins" then
+        player.leaderstats.Coins.Value = session.Data.Coins
+    elseif rootKey == "Inventory" then
+        print(player.Name, "inventory changed:", key, "=", tostring(value))
+    end
+end)
+```
 
 ---
 
@@ -673,7 +877,31 @@ local metadata = session:GetPerformanceMetadata()
 
 | Type | Description |
 |------|-------------|
-| `table` | Contains `Created`, `LastSaved`, `WriteCycles`, and (once modified) `LastModified`. |
+| `table` | A snapshot of the session's runtime metadata. Safe to hold onto, since it's a copy rather than a live reference. |
+
+The returned table contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Created` | `number` | `os.time()` when the `DataSession` was constructed. |
+| `LastSaved` | `number` | `os.time()` of the last successful `Save()` or `SavePatch()`. |
+| `WriteCycles` | `number` | Cumulative count of successful `Save()` and `SavePatch()` calls combined. |
+| `LastModified` | `number?` | `os.time()` of the most recent write to `Data`. Absent until the first mutation happens. |
+
+---
+
+### Example
+
+```lua
+local function printSessionHealth(session)
+    local meta = session:GetPerformanceMetadata()
+
+    print(("Saved %d time(s), last save %ds ago"):format(
+        meta.WriteCycles,
+        os.time() - meta.LastSaved
+    ))
+end
+```
 
 ---
 
@@ -722,3 +950,19 @@ Nothing.
 - The standard way to end any session under normal circumstances.
 - `Players.PlayerRemoving`.
 - Manually closing out a guild, world, or leaderboard session once work on it is finished.
+
+---
+
+### Example
+
+```lua
+Players.PlayerRemoving:Connect(function(player)
+    -- If this key is already loaded on this server, LoadSession() hands back
+    -- the same active DataSession instead of re-locking it.
+    local session = PlayerStore:LoadSession(tostring(player.UserId))
+
+    if session then
+        session:Destroy()
+    end
+end)
+```
