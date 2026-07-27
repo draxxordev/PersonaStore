@@ -1,8 +1,23 @@
-# Getting Started
+# PersonaStore Documentation
 
-PersonaStore is designed to make persistent data management simple while remaining scalable for larger games.
+PersonaStore is a robust, production-ready DataStore persistence framework with native Roblox EncodingService integration, compression, data integrity verification, and advanced session management.
 
-Before loading any player data, the engine must be initialized once.
+## Table of Contents
+
+1. [Getting Started](#getting-started)
+2. [Core API Reference](#core-api-reference)
+3. [EncodingService Integration](#encodingservice-integration)
+4. [Compression & Hashing](#compression--hashing)
+5. [Read-Only Access](#read-only-access)
+6. [Batch Operations](#batch-operations)
+7. [Statistics & Monitoring](#statistics--monitoring)
+8. [Advanced Features](#advanced-features)
+
+---
+
+## Getting Started
+
+Before loading any player data, initialize the engine once:
 
 ```lua
 local PersonaStore = require(ServerStorage.PersonaStore)
@@ -10,123 +25,56 @@ local PersonaStore = require(ServerStorage.PersonaStore)
 PersonaStore:Init()
 ```
 
-Initialization performs several engine-wide tasks:
-
-- Starts the shared MessagingService router
-- Enables cross-server synchronization
-- Registers the automatic BindToClose cleanup
-- Allows DataSessions to be loaded safely
-
-> **Note**
->
-> `:Init()` should only be called once during server startup. Calling it again has no effect beyond a warning; it will not create a second MessagingService subscription.
-
----
-
-After initialization, isolated DataStores are created with `:CreateDataStore()`.
+Create isolated DataStores with optional compression configuration:
 
 ```lua
-local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
-    Schema = PlayerTemplate
+local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v1", {
+    Schema = PlayerTemplate,
+    AutoSaveInterval = 30
 })
 ```
 
-Once a DataStore exists, sessions can be loaded for individual keys.
+Configure compression settings globally:
+
+```lua
+-- Use ZSTD compression (better ratio, slower) with level 9
+PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 9)
+```
+
+Load and interact with sessions:
 
 ```lua
 local session = PlayerStore:LoadSession(tostring(player.UserId))
-```
-
-From there, all data interaction happens through the returned `DataSession`.
-
-```lua
-session.Data.Coins += 100
-session.Data.Level = 5
-```
-
-When finished with a session, always destroy it.
-
-```lua
-session:Destroy()
-```
-
-That's the entire lifecycle:
-
-```
-PersonaStore:Init()
-        ↓
-CreateDataStore()
-        ↓
-LoadSession()
-        ↓
-Read / Modify Data
-        ↓
-Destroy()
+if session then
+    session.Data.Coins += 100
+    session:SavePatch()
+    session:Destroy()
+end
 ```
 
 ---
 
-# API Reference
+## Core API Reference
 
----
+### PersonaStore
 
-# PersonaStore
+The engine singleton that manages all DataStores, compression, and cluster communication.
 
-The engine singleton. Owns the single cluster-wide MessagingService subscription, routes incoming eviction and global-update signals to the correct `Founder`, and drains every open session on every registered store when the server shuts down.
-
----
-
-## PersonaStore.new()
-
-Constructs a new PersonaStore table without starting any live services.
-
-Kept separate from `:Init()` so the module can be required for its class definitions alone (for example, in unit tests) without immediately subscribing to MessagingService or registering a BindToClose handler. Calling this directly is not required for normal usage, since the required module already returns a usable engine table.
-
-```lua
-local Engine = PersonaStore.new()
-```
-
----
-
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `PersonaStore` | A fresh, uninitialized engine table. |
-
----
-
-## PersonaStore:Init()
+#### PersonaStore:Init()
 
 Starts the shared MessagingService subscription and registers the engine-wide shutdown handler.
 
-The subscription is what routes `Eject_Key` and `Global_Update` cluster messages to the correct `Founder`, which in turn routes them to the correct `DataSession`. The shutdown handler walks every registered store's active sessions on `BindToClose` and calls `:Destroy()` on each one, so individual scripts never need their own shutdown handling to avoid losing data on deploys.
-
 ```lua
 PersonaStore:Init()
 ```
 
----
-
-### Returns
-
-Nothing.
+**Must be called once** before any `LoadSession()` calls.
 
 ---
 
-### Notes
+#### PersonaStore:CreateDataStore(storeName, configOptions)
 
-- Must run before any `Founder:LoadSession()` call. `LoadSession` checks whether the engine is active and refuses to load, returning `nil` with a warning, if `Init()` hasn't run yet.
-- Calling `Init()` more than once only emits a warning. It will not create a second subscription or a second shutdown handler.
-- The BindToClose drain does not run inside Studio test sessions, since stalling the editor to flush DataStore writes on every test stop isn't useful.
-
----
-
-## PersonaStore:CreateDataStore()
-
-Creates, or returns an existing, isolated `Founder` object bound to a Roblox DataStore.
-
-Each `Founder` manages its own sessions, schema reconciliation, autosave configuration, and cross-server synchronization independently of every other `Founder`.
+Creates or returns an existing `Founder` (isolated DataStore wrapper).
 
 ```lua
 local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
@@ -135,509 +83,465 @@ local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
 })
 ```
 
----
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `storeName` | `string` | Yes | Name of the Roblox DataStore |
+| `configOptions` | `table` | No | Configuration table |
 
-### Arguments
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `storeName` | `string` | Yes | Name of the Roblox DataStore. |
-| `configOptions` | `table` | No | Optional configuration table. |
-
----
-
-### Configuration
+**Configuration Options:**
 
 | Field | Type | Default | Description |
-|------|------|---------|-------------|
-| `Schema` | `table` | `{}` | Template used when reconciling newly loaded profiles. |
-| `AutoSaveInterval` | `number` | `30` | Seconds between automatic patch saves. |
+|-------|------|---------|-------------|
+| `Schema` | `table` | `{}` | Template for new profiles |
+| `AutoSaveInterval` | `number` | `30` | Seconds between autosaves |
 
 ---
 
-### Returns
+#### PersonaStore:SetCompressionSettings(algorithm, level)
 
-| Type | Description |
-|------|-------------|
-| `Founder` | The DataStore wrapper used to manage sessions. |
-
----
-
-### Best Uses
-
-- Creating separate player databases.
-- Separating inventories from statistics.
-- Guild or clan persistence.
-- World save data.
-- Leaderboards.
-- Seasonal save slots.
-
----
-
-### Example
+Configures compression algorithm and level for all future compression operations.
 
 ```lua
-local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
-    Schema = Template
-})
-
-local GuildStore = PersonaStore:CreateDataStore("Guilds", {
-    Schema = GuildTemplate
-})
+PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 9)
 ```
 
----
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `algorithm` | `Enum.CompressionAlgorithm` | `Deflate` or `ZSTD` |
+| `level` | `number` | 1-22 depending on algorithm (1=faster, 22=better compression) |
 
-### Notes
-
-- Calling this multiple times with the same `storeName` returns the existing `Founder`; the `configOptions` passed on subsequent calls are ignored.
-- Every `Founder` manages its own active sessions, independently of every other store.
-- One `Founder` corresponds to one Roblox DataStore.
-- `Schema` reconciliation is additive only — every `LoadSession()` fills in any key present in `Schema` but missing from a saved profile, without touching or overwriting keys that already exist. This is what lets a new field be added to `Schema` after a game has already shipped without wiping existing players' data.
-
----
-
-# Founder
-
-Represents a single, isolated DataStore. Handles session locking, schema reconciliation, and both live and offline global updates for every key stored under it.
+**Recommendations:**
+- **Deflate, Level 6**: Good balance of speed and compression (default)
+- **ZSTD, Level 9**: Best for data-heavy profiles (slower but ~20-30% better compression)
+- **ZSTD, Level 22**: Maximum compression for archival/exports
 
 ---
 
-## Founder:LoadSession()
+#### PersonaStore:GetStatistics()
 
-Attempts to acquire ownership of a profile and returns a `DataSession` wrapping it.
-
-If this server already has the key loaded, the existing `DataSession` is returned directly instead of re-locking. Otherwise, an `Eject_Key` cluster message is published first so any other server currently holding the lock releases it, then an `UpdateAsync` call claims the lock, reconciles the profile against the store's `Schema`, and stands up a new `DataSession` with autosaving already running.
+Returns engine-wide statistics since server start.
 
 ```lua
-local session = Store:LoadSession(key)
+local stats = PersonaStore:GetStatistics()
+print("Total saves:", stats.TotalSaves)
+print("Bytes saved by compression:", stats.BytesSavedByCompression)
+print("DataStore requests failed:", stats.DatastoreRequestsFailed)
 ```
 
----
+**Returned Table:**
 
-### Arguments
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `key` | `string` | Yes | The profile key to load. |
-
-`key` is whatever string identifies this profile in the DataStore. For player data this is almost always `tostring(player.UserId)`, since it's stable across sessions and unique per account. Nothing about `Founder` assumes the key is a player, though — a guild ID, a world name, or a fixed string like `"Leaderboard_Season3"` works exactly the same way.
-
----
-
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `DataSession?` | `nil` if ownership could not be acquired. |
+| Field | Type | Description |
+|-------|------|-------------|
+| `TotalSaves` | `number` | Count of successful `Save()` / `SavePatch()` calls |
+| `TotalLoads` | `number` | Count of sessions loaded |
+| `TotalCompressions` | `number` | Count of compression operations |
+| `TotalDecompressions` | `number` | Count of decompression operations |
+| `DatastoreRequestsAttempted` | `number` | Total DataStore API calls attempted |
+| `DatastoreRequestsFailed` | `number` | Failed DataStore API calls |
+| `BytesSavedByCompression` | `number` | Total bytes reduced through compression |
 
 ---
 
-### Best Uses
+### Founder
 
-- Loading a player's profile on join.
-- Loading guild, world, or leaderboard data on demand.
-- Any read or write that needs an exclusive lock on a key.
+Represents a single isolated DataStore with session management.
 
----
+#### Founder:LoadSession(key)
 
-### Notes
-
-- Returns `nil`, with a warning, if called before `PersonaStore:Init()`.
-- Returns `nil` if another server holds a valid lock (younger than `GlobalLockTimeout`) under a different `JobId`, even after the `Eject_Key` broadcast, since eviction is asynchronous and may not land before this call's own `UpdateAsync` resolves. Use `LoadSessionAsync()` if a short wait is acceptable.
-- Autosaving starts automatically using the store's `AutoSaveInterval` (default: 30 seconds).
-
----
-
-### Example
-
-A typical join handler treats a `nil` result as "still owned elsewhere" and kicks the player back to the queue rather than letting them play on an unloaded profile:
+Acquires ownership of a profile and returns a `DataSession`.
 
 ```lua
-Players.PlayerAdded:Connect(function(player)
-    local session = PlayerStore:LoadSession(tostring(player.UserId))
-
-    if not session then
-        player:Kick("Your data is still loading. Please rejoin in a few seconds.")
-        return
-    end
-
-    -- session is now safe to read and write
-end)
+local session = Store:LoadSession(tostring(player.UserId))
+if not session then
+    player:Kick("Data is still loading. Please rejoin.")
+    return
+end
 ```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `key` | `string` | Yes | Profile key (usually player UserID) |
+
+**Returns:** `DataSession?` — `nil` if ownership could not be acquired
 
 ---
 
-## Founder:LoadSessionAsync()
+#### Founder:LoadSessionAsync(key, maxWaitSeconds)
 
-Repeatedly attempts to acquire a session, once per second, until successful or the timeout expires.
-
-This exists for cases where waiting a few seconds for a lock to free up is preferable to failing immediately, such as a player rejoining right after a crash, where the previous server's lock hasn't formally timed out yet but its eviction message may still be in flight.
+Repeatedly attempts to acquire a session for up to `maxWaitSeconds`.
 
 ```lua
-local session = Store:LoadSessionAsync(key, maxWait)
+local session = Store:LoadSessionAsync(tostring(player.UserId), 8)
 ```
 
----
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `key` | `string` | Yes | Profile key |
+| `maxWaitSeconds` | `number` | No | Timeout in seconds (default: 10) |
 
-### Arguments
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `key` | `string` | Yes | The profile key to load. |
-| `maxWait` | `number` | No | Maximum seconds to keep retrying. Defaults to `10`. |
-
-`maxWait` caps how long the calling code is willing to wait, not how many attempts are made — internally this polls `LoadSession()` once per second, so `maxWait = 10` means roughly 10 attempts before giving up and returning `nil`.
+**Best for:** Player rejoin after crashes, where waiting 5-10 seconds is preferable to kicking.
 
 ---
 
-### Returns
+#### Founder:LoadReadOnlySession(key)
 
-| Type | Description |
-|------|-------------|
-| `DataSession?` | `nil` if the timeout elapses without acquiring the lock. |
-
----
-
-### Best Uses
-
-- Reconnects shortly after a crash or unexpected disconnect.
-- Any load where a short delay is preferable to an outright failure.
-
----
-
-### Example
+**NEW** - Loads profile data without acquiring a lock (read-only, no mutations).
 
 ```lua
-Players.PlayerAdded:Connect(function(player)
-    local session = PlayerStore:LoadSessionAsync(tostring(player.UserId), 8)
-
-    if not session then
-        player:Kick("Could not load your data. Please try again shortly.")
-        return
-    end
-end)
+local readOnlyData = Store:LoadReadOnlySession(tostring(userId))
+if readOnlyData then
+    print("Coins:", readOnlyData.Data.Coins)
+    print("Level:", readOnlyData.Data.Level)
+end
 ```
 
----
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `key` | `string` | Yes | Profile key |
 
-## Founder:PublishGlobalUpdate()
+**Returns:** `table?` — The profile data, or `nil` if not found
 
-Delivers a payload to a profile regardless of whether the target is online, or which server currently owns its session.
-
-If the key is loaded on the calling server, the payload is delivered immediately through the session's global update listeners. It is also written into the profile's `GlobalUpdates` queue in the DataStore, so a server that loads the profile later still receives it, and broadcast over MessagingService so any other currently running server that owns the session can react without waiting for a reload.
-
-```lua
-Store:PublishGlobalUpdate(key, payload)
-```
-
----
-
-### Arguments
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `key` | `string` | Yes | The profile key to target. |
-| `payload` | `table` | Yes | Arbitrary data describing the update. |
-
-`payload` has no required shape — PersonaStore stores and forwards whatever table is passed in. Since the receiving code has to make sense of it later (in `ListenToGlobalUpdate()` or `ConsumeGlobalUpdates()`), it's worth picking a small convention up front, such as always including a `Type` field, so the handler can branch on what kind of update it received.
+**Use cases:**
+- Leaderboard queries without locking the player
+- Admin panels viewing player data
+- Cross-server data aggregation
 
 ---
 
-### Returns
+#### Founder:PublishGlobalUpdate(key, payload)
 
-| Type | Description |
-|------|-------------|
-| `boolean` | Whether the update was successfully persisted to the DataStore queue. |
-
----
-
-### Best Uses
-
-- Granting items, currency, or mail to a player regardless of which server they're on.
-- Delivering purchases from an external system (e.g. a web store) to an offline player.
-- Banning or flagging an account from an admin panel running elsewhere.
-
----
-
-### Notes
-
-- The `boolean` return reflects whether the queue write succeeded, independent of whether a locally loaded session also received the update live.
-- A session that is offline when this is called consumes the update the next time it loads, via `ConsumeGlobalUpdates()`.
-
----
-
-### Example
-
-Sending a purchase from an external system, using a `Type` field as the convention mentioned above:
+Sends an update to a profile regardless of whether the player is online or which server owns the session.
 
 ```lua
 PlayerStore:PublishGlobalUpdate(tostring(userId), {
     Type = "Currency",
     Amount = 500,
-    Reason = "WebStorePurchase"
+    Reason = "DailyReward"
 })
 ```
 
-Handling it on the receiving end reads the same `Type` field back out — see `ListenToGlobalUpdate()` and `ConsumeGlobalUpdates()` for the two ways to pick it up.
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `key` | `string` | Yes | Profile key |
+| `payload` | `table` | Yes | Arbitrary data describing the update |
+
+**Returns:** `boolean` — Whether the update was successfully queued
+
+**Best for:**
+- Granting items to offline players
+- Delivering web store purchases
+- Admin actions (bans, warnings, etc.)
 
 ---
 
-## Founder:ForceEjectKey()
+#### Founder:BatchUpdate(keys, transformFn)
 
-Requests that every server release a specific profile, without loading it locally.
+**NEW** - Atomically updates multiple profiles with a transformation function.
 
 ```lua
-Store:ForceEjectKey(key)
+local results = PlayerStore:BatchUpdate({userId1, userId2, userId3}, function(data)
+    data.SeasonPoints = 0  -- Reset season points
+    data.SeasonRank = 1
+end)
+
+for key, success in pairs(results) do
+    if success then
+        print("Successfully reset", key)
+    end
+end
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `keys` | `{string}` | Yes | Array of profile keys |
+| `transformFn` | `(data: table) -> ()` | Yes | Function to transform each profile |
+
+**Returns:** `{[string]: boolean}` — Success status per key
+
+**Important:** `BatchUpdate` will wait up to 5 seconds per key. Avoid with very large arrays.
+
+---
+
+#### Founder:GetKeyMetadata(key)
+
+**NEW** - Retrieves metadata about a profile without loading it.
+
+```lua
+local meta = Store:GetKeyMetadata(tostring(userId))
+if meta then
+    print("Version:", meta.Version)
+    print("Last updated:", os.date("%Y-%m-%d %H:%M:%S", meta.LastUpdate))
+    print("Compression:", meta.CompressionMetadata.IsCompressed)
+end
+```
+
+**Returns:** `table?` — Metadata, or `nil` if not found
+
+**Returned Table:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Version` | `number` | Profile version (incremented on each save) |
+| `LastUpdate` | `number` | Unix timestamp of last save |
+| `SessionToken` | `string?` | Current session token if locked |
+| `JobId` | `string?` | Server JobId currently owning the lock |
+| `DataHash` | `string?` | SHA256 hash of profile data (if enabled) |
+| `CompressionMetadata` | `table?` | Compression info |
+
+---
+
+#### Founder:GetCompressionStats()
+
+**NEW** - Returns compression statistics for this store.
+
+```lua
+local stats = Store:GetCompressionStats()
+print("Bytes saved:", stats.BytesSavedByCompression)
 ```
 
 ---
 
-### Arguments
+#### Founder:GetActiveSessionCount()
 
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `key` | `string` | Yes | The profile key to evict. |
-
----
-
-### Returns
-
-Nothing.
-
----
-
-### Best Uses
-
-- Admin tooling that needs to guarantee no server holds a stale lock before a manual DataStore edit.
-- Force-clearing a lock left behind by an abnormal server termination.
-
----
-
-## Founder:GetActiveSessionCount()
-
-Returns the number of currently loaded sessions on this server, for this store.
+Returns the number of currently loaded sessions on this server.
 
 ```lua
 local count = Store:GetActiveSessionCount()
+print("Active sessions:", count)
 ```
 
 ---
 
-### Returns
+### DataSession
 
-| Type | Description |
-|------|-------------|
-| `number` | Count of active sessions. |
+Represents an actively loaded, locked profile. This is the only object for reading/writing profile data.
 
----
-
-# DataSession
-
-Represents an actively loaded, locked profile. This is the only object gameplay code should read or write through.
-
----
-
-## DataSession.Data
+#### DataSession.Data
 
 The observable data table for the loaded profile.
 
-Every read passes through to the underlying data. Every write, at any nesting depth, marks the corresponding top-level field as dirty for the next `SavePatch()` call and fires any callback registered with `ListenToFieldChange()`.
+Every write at any nesting depth marks the top-level field as dirty and fires `ListenToFieldChange` listeners.
 
 ```lua
 session.Data.Coins += 500
-
 session.Data.Inventory.Sword = true
+session.Data.Stats.Level = 10
 ```
 
 ---
 
-### Type
-
-| Type | Description |
-|------|-------------|
-| `table` | Shaped by the store's `Schema`. |
-
----
-
-## DataSession:Save()
+#### DataSession:Save()
 
 Writes the entire profile back to the DataStore.
 
-Confirms the session's lock token still matches before writing, and fails if the lock has since lapsed (for example, following a remote eviction). Clears the dirty-field tracker on success.
-
 ```lua
-session:Save()
+local success = session:Save()
 ```
 
----
+**Returns:** `boolean` — Whether the save succeeded
 
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `boolean` | Whether the save succeeded. |
-
----
-
-### Notes
-
-- Costs more bandwidth than `SavePatch()`, since the full `Data` table is serialized regardless of what changed.
-- Reserve for release-time checkpoints or important events; use `SavePatch()` for routine saving.
+**Notes:**
+- Costs more bandwidth than `SavePatch()`
+- Confirms lock token before writing
+- Use for important checkpoints
 
 ---
 
-## DataSession:SavePatch()
+#### DataSession:SavePatch()
 
-Writes only the top-level fields that have changed since the previous successful save.
-
-If nothing is dirty, this returns `true` immediately without making a DataStore request. Fields that aren't tracked as dirty are left untouched in the cloud, so writes made by another process, such as a global update consumed elsewhere, aren't overwritten.
+Writes only the top-level fields that changed since the last save.
 
 ```lua
 session:SavePatch()
 ```
 
----
+**Returns:** `boolean` — Whether the save succeeded (returns `true` if nothing changed)
 
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `boolean` | Whether the save succeeded. |
-
----
-
-### Notes
-
-- This is what the autosave heartbeat calls internally.
-- Prefer this over `Save()` for periodic autosaving on profiles with large or deeply nested data.
+**Notes:**
+- This is what the autosave heartbeat calls
+- Dramatically reduces bandwidth on large profiles
+- Prefer over `Save()` for routine autosaving
 
 ---
 
-## DataSession:BeginTransaction()
+#### DataSession:SaveCompressed()
 
-Takes a deep-copy snapshot of the current `Data` table for later rollback.
+**NEW** - Saves the entire profile with EncodingService compression.
 
-Has no effect on what's persisted to the DataStore. `Save()` or `SavePatch()` must still be called separately to persist anything. These three methods are meant to be used together, as a set, around any multi-step mutation you might need to undo: call `BeginTransaction()` before the risky changes, then either `CommitTransaction()` once you're satisfied they're valid, or `RollbackTransaction()` to put `Data` back exactly how it was.
+```lua
+local success = session:SaveCompressed()
+```
+
+**Returns:** `boolean` — Whether the save succeeded
+
+**Best for:**
+- Large profiles with deep inventories
+- End-of-session checkpoints
+- Reducing storage costs
+
+**Compression ratio:** Typically 40-70% depending on data structure and algorithm
+
+---
+
+#### DataSession:BeginTransaction()
+
+Takes a deep-copy snapshot of the current `Data` for later rollback.
 
 ```lua
 session:BeginTransaction()
-```
 
----
+session.Data.Coins -= 100
+session.Data.Inventory.Sword = true
 
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `boolean` | `false` if the session has already been released. |
-
----
-
-### Example
-
-A shop purchase that deducts currency and grants an item in two separate writes, but needs to undo both if a later validation step fails:
-
-```lua
-local function purchaseItem(session, itemId, cost)
-    session:BeginTransaction()
-
-    session.Data.Coins -= cost
-    session.Data.Inventory[itemId] = true
-
-    local isValid = session.Data.Coins >= 0 -- e.g. guard against a race on cost
-
-    if isValid then
-        session:CommitTransaction()
-        session:SavePatch()
-    else
-        session:RollbackTransaction()
-    end
-
-    return isValid
+if not validatePurchase() then
+    session:RollbackTransaction()
+else
+    session:CommitTransaction()
+    session:SavePatch()
 end
 ```
 
 ---
 
-## DataSession:CommitTransaction()
+#### DataSession:CommitTransaction()
 
-Discards the snapshot taken by `BeginTransaction()`, keeping the data as it currently stands in memory.
-
-Call this once the changes made since `BeginTransaction()` are confirmed valid. It doesn't persist anything by itself — follow it with `Save()` or `SavePatch()` if the change needs to reach the DataStore. See `BeginTransaction()` for the full pattern.
+Discards the snapshot, keeping data as-is.
 
 ```lua
 session:CommitTransaction()
+session:SavePatch()
 ```
 
 ---
 
-### Returns
+#### DataSession:RollbackTransaction()
 
-Nothing.
-
----
-
-## DataSession:RollbackTransaction()
-
-Restores `Data` to the state captured by the most recent `BeginTransaction()` call, then clears the snapshot.
-
-Call this when a multi-step change turns out to be invalid partway through, instead of manually writing every field back to its old value. See `BeginTransaction()` for the full pattern.
+Restores `Data` to the pre-transaction state.
 
 ```lua
-session:RollbackTransaction()
+local success = session:RollbackTransaction()
 ```
 
----
-
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `boolean` | `false` if no transaction was in progress. |
+**Returns:** `boolean` — `false` if no transaction was active
 
 ---
 
-## DataSession:StartAutoSave()
+#### DataSession:IncrementCounter(fieldName, amount)
 
-Starts a cancellable autosave loop that calls `SavePatch()` every `intervalSeconds`.
-
-Any autosave loop already running on this session is stopped first. Called automatically by `LoadSession()`, so most game code never needs to call this directly.
+**NEW** - Atomically increments a counter in the data.
 
 ```lua
-session:StartAutoSave(interval)
+session:IncrementCounter("Coins", 100)  -- Coins += 100
+session:IncrementCounter("Level")       -- Level += 1
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `fieldName` | `string` | Yes | Field to increment |
+| `amount` | `number` | No | Increment amount (default: 1) |
+
+**Returns:** `boolean` — Whether the save succeeded
+
+**Best for:**
+- Leaderboard score increments
+- Currency transactions
+- Statistics counters
+
+---
+
+#### DataSession:ExportData(includeMetadata)
+
+**NEW** - Exports profile data as JSON string for backup/migration.
+
+```lua
+local json = session:ExportData(true)
+-- Save to file or send to backend...
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `includeMetadata` | `boolean` | No | Include session metadata in export |
+
+**Returns:** `string` — JSON-encoded export
+
+**Exported structure:**
+
+```json
+{
+  "Data": { /* profile data */ },
+  "ExportTime": 1234567890,
+  "SessionToken": "...",  // if includeMetadata = true
+  "Metadata": { /* session metadata */ }
+}
 ```
 
 ---
 
-### Arguments
+#### DataSession:ImportData(jsonString, overwrite)
 
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `interval` | `number` | Yes | Seconds between automatic patch saves. |
+**NEW** - Imports profile data from a JSON export.
 
-Shorter intervals keep the cloud copy of `Data` fresher at the cost of more frequent DataStore requests. Longer intervals cut request volume but widen the window of changes that only exist in memory. This is orthogonal to `BindToClose` safety — `Destroy()` always performs a full `Save()` on shutdown regardless of the configured interval, so the tradeoff here is really about how current the cloud copy stays during normal play (relevant to things like `IsCacheStale()` checks from another server).
+```lua
+local success = session:ImportData(jsonString, false)  -- Merge mode
+-- or
+local success = session:ImportData(jsonString, true)   -- Overwrite mode
+```
 
----
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `jsonString` | `string` | Yes | JSON export string |
+| `overwrite` | `boolean` | No | `true` = replace all data, `false` = merge (default) |
 
-### Returns
-
-Nothing.
-
----
-
-### Notes
-
-- Called automatically inside `LoadSession()` using the store's `AutoSaveInterval` config, so most code never touches this directly.
-- Calling it again restarts the loop at the new interval — useful for temporarily tightening the save cadence around a high-stakes moment, such as right before a trade, then calling it again afterward to restore the default.
+**Returns:** `boolean` — Whether import succeeded
 
 ---
 
-## DataSession:StopAutoSave()
+#### DataSession:VerifyDataIntegrity()
 
-Cancels the running autosave loop, if one exists.
+**NEW** - Verifies profile data integrity using stored hash.
 
-Called automatically by `Release()`, and therefore by `Destroy()`.
+```lua
+if not session:VerifyDataIntegrity() then
+    warn("Profile data was modified externally!")
+    session:Reload()
+end
+```
+
+**Returns:** `boolean` — Whether data hash matches
+
+**Requires:** `PersonaStore.EnableDataIntegrityChecks = true` (enabled by default)
+
+---
+
+#### DataSession:IsCacheStale()
+
+Compares in-memory version against cloud version without acquiring a lock.
+
+```lua
+if session:IsCacheStale() then
+    warn("Profile was modified by another server!")
+end
+```
+
+**Returns:** `boolean` — `true` if cloud version is newer
+
+---
+
+#### DataSession:StartAutoSave(intervalSeconds)
+
+Starts autosave loop with given interval.
+
+```lua
+session:StartAutoSave(15)  -- Save every 15 seconds
+```
+
+**Called automatically by `LoadSession()`** using the store's `AutoSaveInterval` config.
+
+---
+
+#### DataSession:StopAutoSave()
+
+Cancels the autosave loop.
 
 ```lua
 session:StopAutoSave()
@@ -645,134 +549,30 @@ session:StopAutoSave()
 
 ---
 
-### Returns
+#### DataSession:ListenToFieldChange(callback)
 
-Nothing.
-
----
-
-## DataSession:IsCacheStale()
-
-Compares this session's last-synced version stamp against whatever is currently stored in the cloud, without acquiring a lock or mutating anything.
-
-Useful before trusting in-memory `Data` for something high-stakes, such as confirming a trade, since a mismatch should only occur after a forced eviction and steal by another server.
+Fires whenever any field in `Data` changes at any nesting depth.
 
 ```lua
-local stale = session:IsCacheStale()
-```
-
----
-
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `boolean` | `true` if the cloud version is newer than the locally synced version. |
-
----
-
-### Notes
-
-- Returns `false` if the check itself fails, so a transient read error doesn't falsely flag the cache as stale.
-
----
-
-### Example
-
-```lua
-local function confirmTrade(session)
-    if session:IsCacheStale() then
-        warn("Profile was modified elsewhere, refusing to trust in-memory data.")
-        return false
+session:ListenToFieldChange(function(key, value, rootKey)
+    if rootKey == "Coins" then
+        print("Coins changed to:", session.Data.Coins)
+        player.leaderstats.Coins.Value = session.Data.Coins
     end
-
-    -- safe to proceed using session.Data as-is
-    return true
-end
-```
-
----
-
-## DataSession:ConsumeGlobalUpdates()
-
-Returns every global update currently queued in memory for this session and clears the queue.
-
-Includes updates that were already waiting in the cloud when the profile loaded, as well as any that arrived live while the session has been open.
-
-```lua
-local updates = session:ConsumeGlobalUpdates()
-```
-
----
-
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `{table}` | The queued updates, in the order they were received. Each entry is exactly the `payload` table that was passed into `PublishGlobalUpdate()`. |
-
----
-
-### Best Uses
-
-- Right after `LoadSession()` returns, to process anything that arrived while the player was offline.
-- Batch-processing several pending updates at once, rather than reacting to each one individually as it streams in through `ListenToGlobalUpdate()`.
-
----
-
-### Example
-
-Using the `Type` convention introduced in `PublishGlobalUpdate()`:
-
-```lua
-local session = PlayerStore:LoadSession(tostring(player.UserId))
-
-for _, update in session:ConsumeGlobalUpdates() do
-    if update.Type == "Currency" then
-        session.Data.Coins += update.Amount
-    elseif update.Type == "Item" then
-        session.Data.Inventory[update.ItemId] = true
-    end
-end
-```
-
----
-
-## DataSession:ListenToGlobalUpdate()
-
-Registers a callback that fires whenever a live global update arrives from another server while this session is loaded.
-
-```lua
-session:ListenToGlobalUpdate(function(update)
-
 end)
 ```
 
----
-
-### Arguments
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `callback` | `(payload: table) -> ()` | Yes | Invoked once per incoming live update. |
-
-`payload` is the exact same table passed into `PublishGlobalUpdate()` on whichever server sent it — this callback exists to react immediately (a notification, a UI popup), while `ConsumeGlobalUpdates()` exists to actually apply the change to `Data`. Most setups use both: this callback for instant feedback, and a call to `ConsumeGlobalUpdates()` inside (or shortly after) it to commit the change.
+| Argument | Meaning |
+|----------|---------|
+| `key` | The literal field name that was assigned |
+| `value` | The new value |
+| `rootKey` | The top-level field under `Data` that was modified |
 
 ---
 
-### Returns
+#### DataSession:ListenToGlobalUpdate(callback)
 
-Nothing.
-
----
-
-### Notes
-
-- The update is also added to the queue read by `ConsumeGlobalUpdates()`; the two systems don't compete with each other.
-
----
-
-### Example
+Fires whenever a live global update arrives from another server.
 
 ```lua
 session:ListenToGlobalUpdate(function(payload)
@@ -782,154 +582,65 @@ session:ListenToGlobalUpdate(function(payload)
             Text = "+" .. payload.Amount .. " coins"
         })
     end
+end)
+```
 
-    for _, update in session:ConsumeGlobalUpdates() do
-        if update.Type == "Currency" then
-            session.Data.Coins += update.Amount
-        end
+---
+
+#### DataSession:ConsumeGlobalUpdates()
+
+Returns all queued global updates and clears the queue.
+
+```lua
+for _, update in session:ConsumeGlobalUpdates() do
+    if update.Type == "Currency" then
+        session.Data.Coins += update.Amount
+    elseif update.Type == "Item" then
+        session.Data.Inventory[update.ItemId] = true
     end
-end)
-```
-
----
-
-## DataSession:ListenToFieldChange()
-
-Fires whenever any field in `Data` changes, at any nesting depth.
-
-Every write, including one buried several tables deep, passes through the same observable proxy, so this single listener is enough to react to changes anywhere in the profile — there's no need to attach separate listeners per nested table.
-
-```lua
-session:ListenToFieldChange(function(key, value, rootKey)
-
-end)
-```
-
----
-
-### Arguments
-
-| Name | Type | Required | Description |
-|------|------|----------|-------------|
-| `callback` | `(key: string, value: any, rootKey: string) -> ()` | Yes | Invoked on every mutation, at any depth. |
-
-The three callback arguments answer three different questions about the same write:
-
-| Argument | Meaning |
-|----------|---------|
-| `key` | The literal key that was assigned to — whatever sits immediately to the left of `=` in the write that triggered this. |
-| `value` | The new value that was assigned. |
-| `rootKey` | The top-level field under `Data` that this write lives under, no matter how deeply nested the actual write was. This is the same name `SavePatch()` uses internally to decide what's dirty, so it's the reliable one to branch on. |
-
-`key` and `rootKey` are only ever different when the write happens below the top level. Two examples make the distinction concrete:
-
-```lua
-session.Data.Coins = 150
--- key = "Coins", value = 150, rootKey = "Coins"
-
-session.Data.Inventory.Weapons.Sword.Enchants.Fire = true
--- key = "Fire", value = true, rootKey = "Inventory"
-```
-
-In the second case, `key` only tells you the innermost field name (`"Fire"`), which isn't unique on its own — plenty of tables could have a `Fire` key. `rootKey` is what reliably tells you *which top-level system* changed (`"Inventory"`), which is almost always what a listener actually cares about.
-
----
-
-### Returns
-
-Nothing.
-
----
-
-### Best Uses
-
-- Syncing a leaderstat or BillboardGui the instant the underlying value changes, without waiting for a save.
-- Driving client-facing UI updates off the same writes that already mark data dirty for `SavePatch()`.
-- Lightweight debug logging of what's about to go into the next patch save.
-
----
-
-### Example
-
-```lua
-session:ListenToFieldChange(function(key, value, rootKey)
-    if rootKey == "Coins" then
-        player.leaderstats.Coins.Value = session.Data.Coins
-    elseif rootKey == "Inventory" then
-        print(player.Name, "inventory changed:", key, "=", tostring(value))
-    end
-end)
-```
-
----
-
-## DataSession:GetPerformanceMetadata()
-
-Returns a copy of the session's runtime metadata.
-
-```lua
-local metadata = session:GetPerformanceMetadata()
-```
-
----
-
-### Returns
-
-| Type | Description |
-|------|-------------|
-| `table` | A snapshot of the session's runtime metadata. Safe to hold onto, since it's a copy rather than a live reference. |
-
-The returned table contains:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `Created` | `number` | `os.time()` when the `DataSession` was constructed. |
-| `LastSaved` | `number` | `os.time()` of the last successful `Save()` or `SavePatch()`. |
-| `WriteCycles` | `number` | Cumulative count of successful `Save()` and `SavePatch()` calls combined. |
-| `LastModified` | `number?` | `os.time()` of the most recent write to `Data`. Absent until the first mutation happens. |
-
----
-
-### Example
-
-```lua
-local function printSessionHealth(session)
-    local meta = session:GetPerformanceMetadata()
-
-    print(("Saved %d time(s), last save %ds ago"):format(
-        meta.WriteCycles,
-        os.time() - meta.LastSaved
-    ))
 end
 ```
 
+**Returns:** `{table}` — Array of update payloads
+
 ---
 
-## DataSession:Release()
+#### DataSession:GetPerformanceMetadata()
 
-Releases ownership of the profile without saving first.
+Returns runtime metadata about the session.
 
-Removes the session from the store's active sessions and clears the lock in the DataStore, so another server can immediately acquire the profile.
+```lua
+local meta = session:GetPerformanceMetadata()
+print("Last saved:", os.date("%c", meta.LastSaved))
+print("Save cycles:", meta.WriteCycles)
+print("Compression stats:", meta.CompressionStats)
+```
+
+**Returned Table:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `Created` | `number` | Unix timestamp when session was created |
+| `LastSaved` | `number` | Unix timestamp of last successful save |
+| `WriteCycles` | `number` | Count of `Save()` / `SavePatch()` calls |
+| `LastModified` | `number?` | Unix timestamp of last data mutation |
+| `CompressionStats` | `table` | Latest compression stats |
+
+---
+
+#### DataSession:Release()
+
+Releases ownership without saving.
 
 ```lua
 session:Release()
 ```
 
----
-
-### Returns
-
-Nothing.
+**Prefer `Destroy()` for normal cleanup.**
 
 ---
 
-### Notes
-
-- Prefer `Destroy()` for planned disconnects, such as `Players.PlayerRemoving`, so data loss only happens on genuine server crashes, never on ordinary leaves.
-
----
-
-## DataSession:Destroy()
+#### DataSession:Destroy()
 
 Saves the full profile, then releases the session.
 
@@ -937,32 +648,279 @@ Saves the full profile, then releases the session.
 session:Destroy()
 ```
 
----
-
-### Returns
-
-Nothing.
-
----
-
-### Best Uses
-
-- The standard way to end any session under normal circumstances.
-- `Players.PlayerRemoving`.
-- Manually closing out a guild, world, or leaderboard session once work on it is finished.
+**Use for:**
+- `Players.PlayerRemoving`
+- Planned session closure
+- Any graceful disconnect
 
 ---
 
-### Example
+## EncodingService Integration
+
+PersonaStore uses Roblox's native `EncodingService` for efficient serialization.
+
+### Compression Handler
+
+The `CompressionHandler` is an internal utility managing all encoding operations:
+
+**Compression Algorithms:**
+
+| Algorithm | Speed | Compression Ratio | Best For |
+|-----------|-------|-------------------|----------|
+| `Deflate` | Fast | ~40% | General purpose, balanced |
+| `ZSTD` | Slower | ~60-70% | Large profiles, storage optimization |
+
+**Levels:**
+
+- **1-3:** Fastest compression, lower ratio (use for real-time saves)
+- **6:** Default, good balance
+- **9+:** Better compression, slower (use for end-of-session saves)
+- **20-22:** Maximum compression (use for archives/exports)
+
+### Hash Verification
+
+When `PersonaStore.EnableDataIntegrityChecks = true` (default):
+
+- Every `Save()` computes a SHA256 hash of the profile data
+- The hash is stored with the profile
+- `session:VerifyDataIntegrity()` checks if cloud hash matches in-memory hash
+
+**Hash Algorithms Supported:**
+
+- `SHA256` (default, recommended)
+- `SHA1` (faster, less secure)
+- `MD5` (fastest, not recommended for security-critical data)
+
+### Base64 Encoding
+
+When compressed data is stored in DataStore (JSON-compatible format):
 
 ```lua
-Players.PlayerRemoving:Connect(function(player)
-    -- If this key is already loaded on this server, LoadSession() hands back
-    -- the same active DataSession instead of re-locking it.
-    local session = PlayerStore:LoadSession(tostring(player.UserId))
+-- Internally:
+local compressed = CompressionHandler.compress(profileData)
+local base64 = CompressionHandler.encodeToBase64(compressed)
+-- Stored as JSON-safe string in DataStore
+```
 
+---
+
+## Read-Only Access
+
+Use `LoadReadOnlySession()` to query profiles without locks:
+
+```lua
+-- Leaderboard query
+local topPlayers = {}
+for _, userId in ipairs(topUserIds) do
+    local data = PlayerStore:LoadReadOnlySession(tostring(userId))
+    if data then
+        table.insert(topPlayers, {
+            UserId = userId,
+            Coins = data.Data.Coins,
+            Level = data.Data.Level
+        })
+    end
+end
+```
+
+**Advantages:**
+- No lock acquisition overhead
+- No risk of lock conflicts
+- Instant reads
+- Perfect for queries and reporting
+
+---
+
+## Batch Operations
+
+Use `BatchUpdate()` for mass profile modifications:
+
+```lua
+-- Grant season pass bonus to multiple players
+local playerIds = {1234, 5678, 9012}
+
+local results = PlayerStore:BatchUpdate(playerIds, function(data)
+    data.SeasonPoints += 500
+    data.Cosmetics.SeasonPass = true
+end)
+
+print("Successfully updated:", #(results or {}))
+```
+
+Each profile is locked individually, modified, and saved. If a lock fails, that key's result is `false`.
+
+---
+
+## Statistics & Monitoring
+
+Monitor server health and performance:
+
+```lua
+-- Create a monitoring loop
+while true do
+    task.wait(300)  -- Every 5 minutes
+    
+    local stats = PersonaStore:GetStatistics()
+    local playerStore = PersonaStore.RegisteredStores["PlayerData"]
+    
+    print("=== Engine Statistics ===")
+    print("Active sessions:", playerStore:GetActiveSessionCount())
+    print("Total loads:", stats.TotalLoads)
+    print("Total saves:", stats.TotalSaves)
+    print("Failed DataStore requests:", stats.DatastoreRequestsFailed)
+    print("Compression saved bytes:", stats.BytesSavedByCompression / 1024 .. " KB")
+    print("Compression ratio:", math.round(
+        100 * (1 - stats.BytesSavedByCompression / (stats.TotalCompressions * 1000))
+    ) .. "%")
+end
+```
+
+---
+
+## Advanced Features
+
+### Compression Caching
+
+PersonaStore caches compressed data to avoid recompressing unchanged profiles:
+
+```lua
+-- First SaveCompressed() compresses the data
+session:SaveCompressed()
+
+-- Subsequent SaveCompressed() reuses cached result
+session:SaveCompressed()
+```
+
+Cache is automatically invalidated when `Data` is mutated.
+
+### Selective Compression
+
+Use `SaveCompressed()` only when needed:
+
+```lua
+-- Autosave with regular SavePatch()
+session:StartAutoSave(30)
+
+-- Manual full compression save on important events
+if playerWonTournament then
+    session:SaveCompressed()  -- Compress for better storage ratio
+end
+```
+
+### Data Validation
+
+Combine transactions and integrity checks:
+
+```lua
+session:BeginTransaction()
+
+local hadCoins = session.Data.Coins
+session.Data.Coins -= 100
+
+if not validateTransaction() or session.Data.Coins < 0 then
+    session:RollbackTransaction()
+else
+    session:CommitTransaction()
+    session:SavePatch()
+    if not session:VerifyDataIntegrity() then
+        warn("Transaction verification failed!")
+    end
+end
+```
+
+---
+
+## Best Practices
+
+1. **Always initialize:** Call `PersonaStore:Init()` once at server start
+2. **Use `SavePatch()` by default:** Significantly reduces bandwidth for most use cases
+3. **Enable integrity checks:** `PersonaStore.EnableDataIntegrityChecks = true` catches data corruption
+4. **Use compression strategically:** `SaveCompressed()` for large profiles, important checkpoints
+5. **Read-only for queries:** Use `LoadReadOnlySession()` for leaderboards, admin panels
+6. **Clean up sessions:** Always call `Destroy()` on player leave
+7. **Monitor statistics:** Track engine health with `GetStatistics()`
+8. **Configure compression:** Tune compression algorithm and level per your data size
+
+---
+
+## Example: Complete Game Loop
+
+```lua
+local PersonaStore = require(ServerStorage.PersonaStore)
+
+-- Configure engine
+PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 6)
+PersonaStore:Init()
+
+-- Create stores
+local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v2", {
+    Schema = {
+        Coins = 0,
+        Level = 1,
+        Inventory = {},
+        Stats = { Kills = 0, Deaths = 0 }
+    },
+    AutoSaveInterval = 30
+})
+
+-- On player join
+Players.PlayerAdded:Connect(function(player)
+    local session = PlayerStore:LoadSessionAsync(tostring(player.UserId), 10)
+    
+    if not session then
+        player:Kick("Failed to load data. Please rejoin.")
+        return
+    end
+    
+    -- Listen for changes
+    session:ListenToFieldChange(function(key, value, rootKey)
+        if rootKey == "Coins" then
+            player.leaderstats.Coins.Value = session.Data.Coins
+        end
+    end)
+    
+    -- Process queued global updates
+    for _, update in session:ConsumeGlobalUpdates() do
+        if update.Type == "Currency" then
+            session.Data.Coins += update.Amount
+        end
+    end
+    
+    player:SetAttribute("Session", session)
+end)
+
+-- On player leave
+Players.PlayerRemoving:Connect(function(player)
+    local session = player:GetAttribute("Session")
     if session then
-        session:Destroy()
+        session:Destroy()  -- Save and release
     end
 end)
+
+-- Periodic monitoring
+while true do
+    task.wait(300)
+    
+    local stats = PersonaStore:GetStatistics()
+    print("Active sessions:", PlayerStore:GetActiveSessionCount())
+    print("Total saves:", stats.TotalSaves)
+    print("Bytes saved by compression:", stats.BytesSavedByCompression / (1024 * 1024) .. " MB")
+end
 ```
+
+---
+
+## Configuration Reference
+
+### PersonaStore Settings
+
+```lua
+PersonaStore.CompressionAlgorithm = Enum.CompressionAlgorithm.Deflate
+PersonaStore.CompressionLevel = 6
+PersonaStore.EnableDataIntegrityChecks = true
+PersonaStore.HashAlgorithm = Enum.HashAlgorithm.SHA256
+PersonaStore.GlobalLockTimeout = 120  -- seconds
+PersonaStore.GlobalAutoSaveInterval = 30  -- seconds
+```
+
+All settings can be modified before `Init()` or via `:SetCompressionSettings()`.
