@@ -118,7 +118,7 @@ PersonaStore:SetCompressionSettings(Enum.CompressionAlgorithm.ZSTD, 9)
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `algorithm` | `Enum.CompressionAlgorithm` | `Deflate` or `ZSTD` |
+| `algorithm` | `Enum.CompressionAlgorithm` | `ZSTD (only method as of now)` |
 | `level` | `number` | 1-22 depending on algorithm (1=faster, 22=better compression) |
 
 **Recommendations:**
@@ -335,8 +335,8 @@ end
 | `LastUpdate` | `number` | Unix timestamp of last save |
 | `SessionToken` | `string?` | Current session token if locked |
 | `JobId` | `string?` | Server JobId currently owning the lock |
-| `DataHash` | `string?` | SHA256 hash of the whole profile (if enabled; may be stale in `"PerField"` mode until the next full `Save()`) |
-| `FieldHashes` | `table?` | Per-field SHA256 hashes (if enabled) |
+| `DataHash` | `string?` | Sha256 hash of the whole profile (if enabled; may be stale in `"PerField"` mode until the next full `Save()`) |
+| `FieldHashes` | `table?` | Per-field Sha256 hashes (if enabled) |
 | `CompressionMetadata` | `table?` | Compression info |
 
 ---
