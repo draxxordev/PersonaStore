@@ -104,23 +104,6 @@ PersonaStore is composed of three primary objects.
 
 ---
 
-# Documentation
-
--  Getting Started
--  Creating DataStores
--  Loading Sessions
--  Reading & Writing Data
--  Saving
--  Transactions
--  Global Updates
--  Change Listeners
--  Metadata
--  Cleanup
--  FAQ
--  Changelog
-
----
-
 # Example
 
 > Without Generic Types (No AutoComplete)
