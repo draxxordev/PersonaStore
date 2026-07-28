@@ -19,7 +19,7 @@
 -  Retry layer with exponential backoff + jitter
 -  Runtime metadata & diagnostics
 -  Automatic BindToClose cleanup
--  Automatic Serialization
+-  Data Serialization
 -  Buffer Utility
 -  Multiple isolated DataStores through Founder objects
 
