@@ -1,4 +1,4 @@
-<img width="75" height="75" alt="image" src="https://github.com/user-attachments/assets/ab117cd3-8c55-419e-97e0-2d9d1b25c59b" />    
+<img width="75" height="75" alt="image" src="https://github.com/user-attachments/assets/ab117cd3-8c55-419e-97e0-2d9d1b25c59b" />  
 
 # PersonaStore
 
