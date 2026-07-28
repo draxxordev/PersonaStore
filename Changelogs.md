@@ -9,6 +9,7 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 
 ## Added
 *Serialization Engine & BufferArray utility*
+*Automatic Rate Limiting for Datastore Requests*
 
 ### Serialization Engine
 - New global serializer registry, pre-populated with built-in support for `Vector3`, `Vector2`, `CFrame`, `Color3`, `UDim`, and `UDim2`.
