@@ -7,7 +7,8 @@
     locking, observable state tracking, and cross-server synchronization.
 
     Now enhanced with EncodingService integration, compression, hashing, advanced APIs,
-    OrderedDataStore + MemoryStore wrappers, and DataStore Version APIs.
+    OrderedDataStore + MemoryStore wrappers, DataStore Version APIs, and a built-in
+    serialization engine for complex/custom types.
     ========================================================================================
 
     Description:
@@ -34,6 +35,9 @@
         6. MemoryQueueWrapper / MemorySortedMapWrapper (MemoryStoreService Wrappers):
            Retry-wrapped interfaces over MemoryStoreService queues and sorted maps for
            high-throughput, short-lived, in-memory-tier data.
+        7. BufferArray (Typed Array Utility):
+           A thin wrapper over Luau `buffer` for compact, typed numeric arrays (u8/u16/
+           u32/f32/f64/etc.), with base64 encode/decode helpers for DataStore storage.
 
     Advanced Features:
         - Multi-Level Initializer Pipeline via .new() and :CreateDataStore() factories.
@@ -60,13 +64,18 @@
         - Comprehensive statistics and audit logging.
         - Data export/import for backups and migrations.
         - Compression caching to avoid recompressing unchanged data.
+        - Global serializer registry (Vector3 / Vector2 / CFrame / Color3 / UDim / UDim2
+          built in, custom types via RegisterSerializer) with automatic (de)serialization
+          on Save() / SavePatch() / SaveCompressed() / LoadSession(), driven by a
+          per-store `SerializationManifest` (with per-session overrides available too).
+        - BufferArray utility for compact typed numeric arrays.
 
     Built with time, effort, love, and passion for the Roblox Developer Community <3.
 
     Github(repository):
     https://github.com/draxxordev/PersonaStore
 
-    v.1.2.1 [7/27/2026]
+    v.1.3.0 [7/27/2026]
     By @Draxxor
 ]]--
 
@@ -119,6 +128,86 @@ PersonaStore._statistics = {
 	TotalLoads = 0,
 	DatastoreRequestsAttempted = 0,
 	DatastoreRequestsFailed = 0,
+}
+
+--// Global Serializer Registry
+-- Maps a type name (e.g. "Vector3", or any custom name you choose) to a table of
+-- {Serialize = function(value) -> storageSafeData, Deserialize = function(data) -> value}.
+-- Populated with built-ins below; extend with PersonaStore:RegisterSerializer().
+PersonaStore._SerializerRegistry = {
+	Vector3 = {
+		Serialize = function(v)
+			if not v or not v.X then return nil end
+			return {X = v.X, Y = v.Y, Z = v.Z}
+		end,
+		Deserialize = function(data)
+			if not data or not data.X then return nil end
+			return Vector3.new(data.X, data.Y, data.Z)
+		end,
+	},
+
+	Vector2 = {
+		Serialize = function(v)
+			if not v or not v.X then return nil end
+			return {X = v.X, Y = v.Y}
+		end,
+		Deserialize = function(data)
+			if not data or not data.X then return nil end
+			return Vector2.new(data.X, data.Y)
+		end,
+	},
+
+	CFrame = {
+		Serialize = function(cf)
+			if not cf then return nil end
+			return {c = {cf:GetComponents()}}
+		end,
+		Deserialize = function(data)
+			if not data or not data.c then return nil end
+			return CFrame.fromMatrix(
+				Vector3.new(data.c[1], data.c[2], data.c[3]),
+				Vector3.new(data.c[4], data.c[5], data.c[6]),
+				Vector3.new(data.c[7], data.c[8], data.c[9]),
+				Vector3.new(data.c[10], data.c[11], data.c[12])
+			)
+		end,
+	},
+
+	Color3 = {
+		Serialize = function(c)
+			if not c or not c.R then return nil end
+			return {R = c.R, G = c.G, B = c.B}
+		end,
+		Deserialize = function(data)
+			if not data or not data.R then return nil end
+			return Color3.new(data.R, data.G, data.B)
+		end,
+	},
+
+	UDim = {
+		Serialize = function(u)
+			if not u or not u.Scale then return nil end
+			return {Scale = u.Scale, Offset = u.Offset}
+		end,
+		Deserialize = function(data)
+			if not data then return nil end
+			return UDim.new(data.Scale or 0, data.Offset or 0)
+		end,
+	},
+
+	UDim2 = {
+		Serialize = function(ud)
+			if not ud or not ud.X then return nil end
+			return {
+				X = {Scale = ud.X.Scale, Offset = ud.X.Offset},
+				Y = {Scale = ud.Y.Scale, Offset = ud.Y.Offset},
+			}
+		end,
+		Deserialize = function(data)
+			if not data or not data.X then return nil end
+			return UDim2.new(data.X.Scale or 0, data.X.Offset or 0, data.Y.Scale or 0, data.Y.Offset or 0)
+		end,
+	},
 }
 
 --// Private Utility Functions (Internal Use Only)
@@ -249,6 +338,109 @@ local function reconcileData(target: table, template: table)
 	end
 end
 
+--// Serialization Engine
+-- Converts complex/custom types (Vector3, CFrame, Color3, ...) into plain,
+-- JSON/DataStore-safe tables so they survive Save()/SavePatch()/SaveCompressed(),
+-- and converts them back on LoadSession(). Driven by a "manifest": a table of
+-- {fieldName = typeName, ...} configured per-store (Founder config's
+-- `SerializationManifest`) and/or per-session (DataSession:SetSerialize()).
+
+local function getSerializer(typeName: string)
+	return PersonaStore._SerializerRegistry[typeName]
+end
+
+-- Recursively serialize a value. If `typeName` is given, that registered serializer is
+-- used directly on the value (this is how manifest-marked fields are handled). If not,
+-- known Roblox types are auto-detected via typeof(), and plain tables are walked
+-- recursively so nested/embedded typed values (e.g. an array of CFrames inside a
+-- manifest-marked field) still get converted correctly.
+local function serializeValue(value: any, typeName: string?): any
+	if value == nil then
+		return nil
+	end
+
+	if typeName then
+		local serializer = getSerializer(typeName)
+		if serializer then
+			return {
+				__serialized = true,
+				__type = typeName,
+				__data = serializer.Serialize(value),
+			}
+		end
+		warn("[PersonaStore]: No serializer registered for type '" .. tostring(typeName) .. "'; storing raw")
+	end
+
+	local robloxType = typeof(value)
+	local autoSerializer = getSerializer(robloxType)
+	if autoSerializer then
+		return {
+			__serialized = true,
+			__type = robloxType,
+			__data = autoSerializer.Serialize(value),
+		}
+	end
+
+	if type(value) == "table" then
+		local serialized = {}
+		for key, nestedValue in pairs(value) do
+			serialized[key] = serializeValue(nestedValue)
+		end
+		return serialized
+	end
+
+	return value
+end
+
+-- Recursively deserialize a value, reversing serializeValue().
+local function deserializeValue(value: any): any
+	if value == nil or type(value) ~= "table" then
+		return value
+	end
+
+	if value.__serialized == true and value.__type and value.__data ~= nil then
+		local serializer = getSerializer(value.__type)
+		if serializer then
+			return serializer.Deserialize(value.__data)
+		end
+		warn("[PersonaStore]: No serializer registered for type '" .. tostring(value.__type) .. "'; leaving raw")
+		return value.__data
+	end
+
+	local deserialized = {}
+	for key, nestedValue in pairs(value) do
+		deserialized[key] = deserializeValue(nestedValue)
+	end
+	return deserialized
+end
+
+-- Applies a manifest ({fieldName = typeName, ...}) to a raw Data table IN-PLACE,
+-- converting the marked top-level fields into storage-safe form.
+local function applyManifestSerialize(dataTable: table?, manifest: table?)
+	if not dataTable or not manifest or next(manifest) == nil then
+		return
+	end
+
+	for fieldName, typeName in pairs(manifest) do
+		if dataTable[fieldName] ~= nil then
+			dataTable[fieldName] = serializeValue(dataTable[fieldName], typeName)
+		end
+	end
+end
+
+-- Reverses applyManifestSerialize() on a raw Data table IN-PLACE.
+local function applyManifestDeserialize(dataTable: table?, manifest: table?)
+	if not dataTable or not manifest or next(manifest) == nil then
+		return
+	end
+
+	for fieldName in pairs(manifest) do
+		if dataTable[fieldName] ~= nil then
+			dataTable[fieldName] = deserializeValue(dataTable[fieldName])
+		end
+	end
+end
+
 -- Generates a deeply nested proxy framework to intercept mutations and trigger listeners.
 local function createObservableTable(rawTable: table, changeCallback: (key: string, value: any, rootKey: string) -> (), rootKey: string?)
 	local proxy = {}
@@ -364,6 +556,10 @@ function DataSession.new<T>(key: string, rawData: table, token: string, parentSt
 	self._pendingGlobalUpdates = {}
 	self._compressionCache = nil -- Cached compressed data (per-session, not global)
 
+	-- Inherit the store-level SerializationManifest (deep-copied so per-session
+	-- SetSerialize()/MarkFieldSerialized() calls don't mutate the Founder's copy).
+	self._serializationManifest = deepCopy((parentStore and parentStore._serializationManifest) or {})
+
 	self.Data = createObservableTable(rawData.Data, function(mutatedKey, mutatedValue, rootKey)
 		self._metadata.LastModified = os.time()
 		self._dirtyFields[rootKey] = true
@@ -385,6 +581,59 @@ end
 -- Connects a callback that fires whenever a live global update arrives from another server
 function DataSession:ListenToGlobalUpdate(callback: (payload: table) -> ())
 	table.insert(self._globalUpdateListeners, callback)
+end
+
+-- Marks multiple fields for automatic (de)serialization, e.g.
+--   session:SetSerialize({Position = "Vector3", Rotation = "CFrame"})
+-- This REPLACES whatever manifest the session currently has (including whatever it
+-- inherited from the Founder's `SerializationManifest` config). Use
+-- MarkFieldSerialized() instead if you just want to add one field.
+function DataSession:SetSerialize(manifest: table): boolean
+	if type(manifest) ~= "table" then
+		warn("[DataSession]: SetSerialize() expects a table of {fieldName = typeName, ...}")
+		return false
+	end
+
+	self._serializationManifest = manifest
+	return true
+end
+
+-- Marks a single field for automatic (de)serialization without touching the rest of
+-- the manifest.
+function DataSession:MarkFieldSerialized(fieldName: string, typeName: string): boolean
+	if not fieldName or not typeName then
+		return false
+	end
+
+	self._serializationManifest = self._serializationManifest or {}
+	self._serializationManifest[fieldName] = typeName
+	return true
+end
+
+-- Manually serializes a value: uses the registered serializer for `typeName` if given,
+-- otherwise auto-detects known Roblox types (and recurses into plain tables).
+function DataSession:Serialize(value: any, typeName: string?): any
+	return serializeValue(value, typeName)
+end
+
+-- Manually reverses Serialize().
+function DataSession:Deserialize(value: any): any
+	return deserializeValue(value)
+end
+
+-- Returns a storage-safe (serialized) deep copy of the whole profile, with every
+-- manifest-marked field converted. Useful if you want to inspect/ship the exact bytes
+-- that a Save() would write without actually saving.
+function DataSession:_SerializeProfile(): table
+	local serialized = deepCopy(self.Data)
+	applyManifestSerialize(serialized, self._serializationManifest)
+	return serialized
+end
+
+-- Deserializes manifest-marked fields of a raw profile table IN-PLACE, returning it.
+function DataSession:_DeserializeProfile(rawData: table): table
+	applyManifestDeserialize(rawData, self._serializationManifest)
+	return rawData
 end
 
 -- Feature: Atomic Transaction Protection (Rollback Setup)
@@ -416,16 +665,18 @@ function DataSession:Save(): boolean
 	if self._isReleased then return false end
 
 	local success, err = withRetry(function()
-		print("UpdateAsync attempt", os.clock())
-
 		self._storeRef._storageInstance:UpdateAsync(self._key, function(currentRaw)
-			print("Inside UpdateAsync callback")
-
 			if not currentRaw or currentRaw.SessionToken ~= self._token then
 				error("Ownership mismatch detected; session token has lapsed.")
 			end
 
 			currentRaw.Data = deepCopy(self.Data)
+
+			-- Convert manifest-marked fields (Vector3, CFrame, custom types, ...) into
+			-- storage-safe form BEFORE hashing/writing, so both the persisted record
+			-- and its integrity hashes reflect what's actually being stored.
+			applyManifestSerialize(currentRaw.Data, self._serializationManifest)
+
 			currentRaw.LastUpdate = os.time()
 			currentRaw.Revision = (currentRaw.Revision or 0) + 1
 
@@ -498,6 +749,10 @@ function DataSession:SavePatch(): boolean
 	end
 
 	local exportedSnapshot = deepCopy(self.Data)
+
+	-- Serialize manifest-marked fields BEFORE they're written/hashed, so a patch save
+	-- persists the same storage-safe form a full Save() would.
+	applyManifestSerialize(exportedSnapshot, self._serializationManifest)
 
 	local success, err = withRetry(function()
 		self._storeRef._storageInstance:UpdateAsync(self._key, function(currentRaw)
@@ -573,6 +828,11 @@ function DataSession:SaveCompressed(): boolean
 			end
 
 			local dataToSave = deepCopy(self.Data)
+
+			-- Serialize manifest-marked fields BEFORE JSON-encoding/compressing, since
+			-- JSONEncode can't handle Vector3/CFrame/etc. directly.
+			applyManifestSerialize(dataToSave, self._serializationManifest)
+
 			local jsonData = HttpService:JSONEncode(dataToSave)
 			local originalSize = #jsonData
 
@@ -695,6 +955,10 @@ function DataSession:VerifyDataIntegrity(): boolean
 
 	local snapshot = deepCopy(self.Data)
 
+	-- Serialize manifest-marked fields so the hash we compute here matches the hash
+	-- that was computed from the (already-serialized) stored data at save time.
+	applyManifestSerialize(snapshot, self._serializationManifest)
+
 	if PersonaStore.IntegrityMode == "PerField" then
 		if not remoteRaw.FieldHashes then
 			return false
@@ -745,8 +1009,14 @@ end
 
 -- Export profile data for backup/migration
 function DataSession:ExportData(includeMetadata: boolean?): string
+	local exportedData = deepCopy(self.Data)
+
+	-- Serialize manifest-marked fields so the export is plain, JSON-safe data (and so
+	-- ImportData() can round-trip it back into real Vector3/CFrame/etc. objects).
+	applyManifestSerialize(exportedData, self._serializationManifest)
+
 	local export = {
-		Data = deepCopy(self.Data),
+		Data = exportedData,
 		ExportTime = os.time(),
 		SessionToken = includeMetadata and self._token or nil,
 		Metadata = includeMetadata and self._metadata or nil,
@@ -766,6 +1036,10 @@ function DataSession:ImportData(jsonString: string, overwrite: boolean?): boolea
 	if not success or not decoded.Data then
 		return false
 	end
+
+	-- Reverse the serialization ExportData() applied, so manifest-marked fields come
+	-- back in as real Vector3/CFrame/etc. objects rather than raw {__serialized=...} tables.
+	applyManifestDeserialize(decoded.Data, self._serializationManifest)
 
 	self:BeginTransaction()
 
@@ -858,6 +1132,13 @@ local Founder = {}
 Founder.__index = Founder
 
 -- Constructor for an isolated DataStore mapping object
+-- configOptions supports (among others):
+--   Schema                 -> template used to reconcile missing fields on load
+--   AutoSaveInterval        -> seconds between automatic SavePatch() calls
+--   SerializationManifest   -> {fieldName = typeName, ...} applied to every session
+--                               loaded from this store (Vector3/CFrame/Color3/UDim/
+--                               UDim2/Vector2 are built in; register custom types via
+--                               PersonaStore:RegisterSerializer() first)
 function Founder.new<T>(storeName: string, configOptions: table): Founder<T>
 	local self = setmetatable({}, Founder)
 
@@ -866,6 +1147,7 @@ function Founder.new<T>(storeName: string, configOptions: table): Founder<T>
 	self._storageInstance = DataStoreService:GetDataStore(storeName)
 	self._activeSessions = {}
 	self._templateSchema = self._config.Schema or {}
+	self._serializationManifest = self._config.SerializationManifest or {}
 
 	PersonaStore.RegisteredStores[storeName] = self
 
@@ -936,6 +1218,14 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 		return nil
 	end
 
+	-- IMPORTANT: this runs AFTER UpdateAsync has already returned (i.e. the record
+	-- that's currently sitting in the DataStore is still in its serialized/storage-safe
+	-- form). We only mutate activeSessionObject.Data in-place here, turning
+	-- manifest-marked fields back into real Vector3/CFrame/etc. objects for the live
+	-- session -- deserializing INSIDE the UpdateAsync callback would instead try to
+	-- persist raw Roblox types, which DataStores reject.
+	applyManifestDeserialize(activeSessionObject.Data, self._serializationManifest)
+
 	local newSession = DataSession.new(key, activeSessionObject, uniqueToken, self)
 	newSession._metadata.SyncedRevision = activeSessionObject.Revision or 0
 
@@ -979,7 +1269,13 @@ function Founder:LoadReadOnlySnapshot<T>(key: string): table?
 	-- Decompress if needed before returning snapshot
 	decompressRawIfNeeded(data)
 
-	return deepCopy(data)
+	local snapshot = deepCopy(data)
+
+	-- Reverse manifest serialization so callers get real Vector3/CFrame/etc. objects,
+	-- consistent with what LoadSession() hands back.
+	applyManifestDeserialize(snapshot.Data, self._serializationManifest)
+
+	return snapshot
 end
 
 -- Alias for backwards compatibility
@@ -1121,7 +1417,8 @@ function Founder:ListVersionsAsync(key: string, sortDirection: Enum.SortDirectio
 end
 
 -- Fetches a specific historical version of a key's raw record, decompressing its
--- Data automatically if that version happened to be stored compressed.
+-- Data automatically if that version happened to be stored compressed, and reversing
+-- any manifest serialization so callers get real Vector3/CFrame/etc. objects back.
 function Founder:GetVersionAsync(key: string, version: string): table?
 	local success, data = withRetry(function()
 		return self._storageInstance:GetVersionAsync(key, version)
@@ -1134,7 +1431,10 @@ function Founder:GetVersionAsync(key: string, version: string): table?
 
 	decompressRawIfNeeded(data)
 
-	return deepCopy(data)
+	local snapshot = deepCopy(data)
+	applyManifestDeserialize(snapshot.Data, self._serializationManifest)
+
+	return snapshot
 end
 
 -- Permanently removes a specific historical version of a key. This cannot be undone.
@@ -1375,12 +1675,183 @@ function MemorySortedMapWrapper:Update(key: string, transformFn: (oldValue: any)
 	return result
 end
 
+--// Class BufferArray
+
+-- Type-safe typed array utility built on Luau `buffer`. Useful for compact numeric
+-- storage (leaderboard snapshots, grids, particle-ish data, etc.) that you may then
+-- base64-encode into a DataStore field.
+
+local BufferArray = {}
+BufferArray.__index = BufferArray
+
+-- Size of each type in bytes
+local typeSizes = {
+	u8 = 1, i8 = 1,
+	u16 = 2, i16 = 2,
+	u32 = 4, i32 = 4,
+	u64 = 8, i64 = 8,
+	f32 = 4,
+	f64 = 8,
+}
+
+-- Reader function names on the global `buffer` library (buffer.readXXX)
+local bufferReadMethods = {
+	u8 = "readu8", i8 = "readi8",
+	u16 = "readu16", i16 = "readi16",
+	u32 = "readu32", i32 = "readi32",
+	u64 = "readu64", i64 = "readi64",
+	f32 = "readf32",
+	f64 = "readf64",
+}
+
+-- Writer function names on the global `buffer` library (buffer.writeXXX)
+local bufferWriteMethods = {
+	u8 = "writeu8", i8 = "writei8",
+	u16 = "writeu16", i16 = "writei16",
+	u32 = "writeu32", i32 = "writei32",
+	u64 = "writeu64", i64 = "writei64",
+	f32 = "writef32",
+	f64 = "writef64",
+}
+
+-- Create a new typed array
+function BufferArray.new(elementType: string, elementCount: number): BufferArray
+	if not typeSizes[elementType] then
+		error("[BufferArray]: Unknown element type '" .. tostring(elementType) .. "'")
+	end
+
+	if type(elementCount) ~= "number" or elementCount < 1 then
+		error("[BufferArray]: elementCount must be a positive integer")
+	end
+
+	local elementSize = typeSizes[elementType]
+	local totalSize = elementSize * elementCount
+
+	local self = setmetatable({
+		_buffer = buffer.create(totalSize),
+		_elementType = elementType,
+		_elementSize = elementSize,
+		_elementCount = elementCount,
+		_readMethod = bufferReadMethods[elementType],
+		_writeMethod = bufferWriteMethods[elementType],
+	}, BufferArray)
+
+	return self
+end
+
+-- Get element at index (0-based)
+-- BUG FIX: the original implementation indexed the buffer VALUE itself with a string
+-- key (self._buffer[self._readMethod](...)) -- Luau buffers aren't tables, so that
+-- isn't callable/indexable. The reader/writer functions live on the global `buffer`
+-- library instead, e.g. buffer.readu8(self._buffer, offset).
+function BufferArray:Get(index: number): number
+	if index < 0 or index >= self._elementCount then
+		error("[BufferArray]: Index out of bounds: " .. index)
+	end
+
+	local offset = index * self._elementSize
+	return buffer[self._readMethod](self._buffer, offset)
+end
+
+-- Set element at index (0-based)
+function BufferArray:Set(index: number, value: number): boolean
+	if index < 0 or index >= self._elementCount then
+		error("[BufferArray]: Index out of bounds: " .. index)
+	end
+
+	local offset = index * self._elementSize
+	buffer[self._writeMethod](self._buffer, offset, value)
+	return true
+end
+
+-- Get multiple elements as a table
+function BufferArray:GetRange(startIndex: number, length: number): {number}
+	if startIndex < 0 or startIndex + length > self._elementCount then
+		error("[BufferArray]: Range out of bounds")
+	end
+
+	local result = {}
+	for i = 0, length - 1 do
+		table.insert(result, self:Get(startIndex + i))
+	end
+
+	return result
+end
+
+-- Set multiple elements from a table
+function BufferArray:SetRange(startIndex: number, values: {number}): boolean
+	if startIndex < 0 or startIndex + #values > self._elementCount then
+		error("[BufferArray]: Range out of bounds")
+	end
+
+	for i, value in ipairs(values) do
+		self:Set(startIndex + i - 1, value)
+	end
+
+	return true
+end
+
+-- Fill entire array with a value
+function BufferArray:Fill(value: number): boolean
+	for i = 0, self._elementCount - 1 do
+		self:Set(i, value)
+	end
+	return true
+end
+
+-- Get the raw buffer for direct access or serialization
+function BufferArray:GetBuffer(): buffer
+	return self._buffer
+end
+
+-- Get array metadata
+function BufferArray:GetMetadata(): table
+	return {
+		ElementType = self._elementType,
+		ElementSize = self._elementSize,
+		ElementCount = self._elementCount,
+		TotalSize = buffer.len(self._buffer),
+	}
+end
+
+-- Encode to base64 for storage
+function BufferArray:EncodeToBase64(): string
+	return CompressionHandler.encodeToBase64(self._buffer)
+end
+
+-- Static method: decode from base64
+function BufferArray.DecodeFromBase64(elementType: string, encoded: string): BufferArray?
+	if not typeSizes[elementType] then
+		error("[BufferArray]: Unknown element type '" .. tostring(elementType) .. "'")
+	end
+
+	local decodedBuffer = CompressionHandler.decodeFromBase64(encoded)
+	local elementSize = typeSizes[elementType]
+	local elementCount = buffer.len(decodedBuffer) / elementSize
+
+	if elementCount ~= math.floor(elementCount) then
+		error("[BufferArray]: Decoded buffer size doesn't align with element size")
+	end
+
+	local self = setmetatable({
+		_buffer = decodedBuffer,
+		_elementType = elementType,
+		_elementSize = elementSize,
+		_elementCount = elementCount,
+		_readMethod = bufferReadMethods[elementType],
+		_writeMethod = bufferWriteMethods[elementType],
+	}, BufferArray)
+
+	return self
+end
+
 -- Creates the engine singleton
 function PersonaStore.new()
 	return setmetatable({}, PersonaStore)
 end
 
 -- Registers and returns a new isolated Founder
+-- If a store with the same name already exists, it returns the existing one
 function PersonaStore:CreateDataStore<T>(storeName: string, configOptions: table): Founder<T>
 	if self.RegisteredStores[storeName] then
 		return self.RegisteredStores[storeName] :: T
@@ -1390,6 +1861,7 @@ function PersonaStore:CreateDataStore<T>(storeName: string, configOptions: table
 end
 
 -- Registers and returns a new isolated OrderedFounder
+-- If a store with the same name already exists, it returns the existing one
 function PersonaStore:CreateOrderedDataStore<T>(storeName: string): OrderedFounder<T>
 	if self.RegisteredOrderedStores[storeName] then
 		return self.RegisteredOrderedStores[storeName] :: T
@@ -1399,6 +1871,7 @@ function PersonaStore:CreateOrderedDataStore<T>(storeName: string): OrderedFound
 end
 
 -- Registers and returns a new MemoryQueueWrapper
+-- If a queue with the same name already exists, it returns the existing one
 function PersonaStore:CreateMemoryQueue(name: string): MemoryQueueWrapper
 	if self.RegisteredMemoryQueues[name] then
 		return self.RegisteredMemoryQueues[name]
@@ -1417,10 +1890,30 @@ function PersonaStore:CreateMemorySortedMap(name: string): MemorySortedMapWrappe
 end
 
 -- Boots the shared MessagingService subscription and the BindToClose drain
-function PersonaStore:Init()
+-- Only call this once on the server
+--[[
+	CompressionAlgorithm: Enum.CompressionAlgorithm?, -- default Zstd
+	CompressionLevel: number?, -- default 6
+	EnableDataIntegrityChecks: boolean?, -- default true
+	HashAlgorithm: Enum.HashAlgorithm?, -- default sha256
+	IntegrityMode: "Full" | "HashOnlyOnFullSave" | "PerField"?, -- default Full
+	GlobalLockTimeout: number?, -- default 120 (seconds)
+	GlobalAutoSaveInterval: number?, -- default 30 (seconds) 
+]]--
+function PersonaStore:Init(settings: PersonaStoreSettings?)
 	if PersonaStore.EngineActive then
 		warn("[PersonaStore]: Init() called more than once!")
 		return
+	end
+	
+	if settings and settings ~= {} then
+		for k, v in settings do
+			if PersonaStore[k] then
+				PersonaStore[k] = v
+			else
+				error("[PersonaStore]: Invalid setting key '" .. tostring(k) .. "'")
+			end
+		end
 	end
 
 	PersonaStore.EngineActive = true
@@ -1500,14 +1993,34 @@ function PersonaStore:SetIntegrityMode(mode: string)
 	PersonaStore.IntegrityMode = mode
 end
 
+-- Registers a custom (de)serializer for a type name, so it can be used in a Founder's
+-- `SerializationManifest`, a session's SetSerialize()/MarkFieldSerialized(), or passed
+-- explicitly to DataSession:Serialize(value, "MyType"). `serializer` must be a table
+-- with Serialize(value) -> storageSafeData and Deserialize(data) -> value.
+--
+-- Example:
+--   PersonaStore:RegisterSerializer("Currency", {
+--       Serialize = function(c) return {Amount = c.Amount, Kind = c.Kind} end,
+--       Deserialize = function(d) return Currency.new(d.Amount, d.Kind) end,
+--   })
+function PersonaStore:RegisterSerializer(typeName: string, serializer: table): boolean
+	if type(serializer) ~= "table" or type(serializer.Serialize) ~= "function" or type(serializer.Deserialize) ~= "function" then
+		warn("[PersonaStore]: RegisterSerializer() requires a table with Serialize and Deserialize functions")
+		return false
+	end
+
+	self._SerializerRegistry[typeName] = serializer
+	return true
+end
+
+--// Expose the serialization engine and BufferArray on the module table itself so
+-- they're usable without a live session, e.g. PersonaStore.SerializeValue(v, "Vector3")
+-- or PersonaStore.BufferArray.new("u32", 1000).
+PersonaStore.BufferArray = BufferArray
+PersonaStore.SerializeValue = serializeValue
+PersonaStore.DeserializeValue = deserializeValue
+
 -- Client require guard.
--- BUG FIX: this used to be `withRetry(task.spawn(function() ... end))`, which passes a
--- THREAD (the return value of task.spawn) into withRetry. withRetry then does
--- `pcall(attemptFn)` on that thread, which is not callable, so pcall fails immediately
--- on every one of its 5 attempts (burning through exponential backoff) before finally
--- surfacing the WRONG error entirely. Fixed to call withRetry with an actual function,
--- and to use maxAttempts = 1 since "are we on the server" is not a transient condition
--- worth retrying/backing off on.
 local guardSuccess, guardErr = withRetry(function()
 	if not RunService:IsServer() then
 		error("PersonaStore can only be required from the server")
@@ -1520,8 +2033,29 @@ if not guardSuccess then
 end
 
 --// Final Exports for autocomplete
+export type PersonaStoreSettings = {
+	CompressionAlgorithm: Enum.CompressionAlgorithm?, -- default Zstd
+	CompressionLevel: number?, -- default 6
+	EnableDataIntegrityChecks: boolean?, -- default true
+	HashAlgorithm: Enum.HashAlgorithm?, -- default sha256
+	IntegrityMode: "Full" | "HashOnlyOnFullSave" | "PerField"?, -- default Full
+	GlobalLockTimeout: number?, -- default 120 (seconds)
+	GlobalAutoSaveInterval: number?, -- default 30 (seconds) 
+}
+
 export type MemoryQueueWrapper = typeof(MemoryQueueWrapper)
 export type MemorySortedMapWrapper = typeof(MemorySortedMapWrapper)
+
+export type BufferArray = {
+	Get: (self: BufferArray, index: number) -> number,
+	Set: (self: BufferArray, index: number, value: number) -> boolean,
+	GetRange: (self: BufferArray, startIndex: number, length: number) -> {number},
+	SetRange: (self: BufferArray, startIndex: number, values: {number}) -> boolean,
+	Fill: (self: BufferArray, value: number) -> boolean,
+	GetBuffer: (self: BufferArray) -> buffer,
+	GetMetadata: (self: BufferArray) -> table,
+	EncodeToBase64: (self: BufferArray) -> string,
+}
 
 export type Founder<T> = {
 	_storeName: string,
@@ -1529,6 +2063,7 @@ export type Founder<T> = {
 	_storageInstance: DataStore,
 	_activeSessions: {[string]: DataSession<T>},
 	_templateSchema: T,
+	_serializationManifest: table,
 
 	LoadSession: (self: Founder<T>, key: string) -> DataSession<T>?,
 	LoadSessionAsync: (self: Founder<T>, key: string, maxWaitSeconds: number?) -> DataSession<T>?,
