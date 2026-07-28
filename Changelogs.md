@@ -5,7 +5,7 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 
 ---
 
-# v1.3.0
+# v1.4.0
 
 ## Added
 *Serialization Engine & BufferArray utility*
