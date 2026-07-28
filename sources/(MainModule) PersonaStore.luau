@@ -1410,7 +1410,8 @@ Founder.__index = Founder
 --                               loaded from this store (Vector3/CFrame/Color3/UDim/
 --                               UDim2/Vector2 are built in; register custom types via
 --                               PersonaStore:RegisterSerializer() first)
-function Founder.new<T>(storeName: string, configOptions: table): Founder<T>
+
+function Founder.new<T>(storeName: string, configOptions: FounderConfig): Founder<T>
 	local self = setmetatable({}, Founder)
 
 	self._storeName = storeName
@@ -2124,7 +2125,7 @@ end
 
 -- Registers and returns a new isolated Founder
 -- If a store with the same name already exists, it returns the existing one
-function PersonaStore:CreateDataStore<T>(storeName: string, configOptions: table): Founder<T>
+function PersonaStore:CreateDataStore<T>(storeName: string, configOptions: FounderConfig): Founder<T>
 	if self.RegisteredStores[storeName] then
 		return self.RegisteredStores[storeName] :: T
 	end
@@ -2402,6 +2403,12 @@ export type Founder<T> = {
 	LoadReadOnlySnapshot: (self: Founder<T>, key: string) -> table?,
 	LoadReadOnlySession: (self: Founder<T>, key: string) -> table?,
 	ForceEjectKey: (self: Founder<T>, key: string) -> (),
+}
+
+export type FounderConfig = {
+	Schema: table?,
+	SerializationManifest: table?,
+	AutoSaveInterval: number?,
 }
 
 export type OrderedFounder<T> = typeof(OrderedFounder) & {
