@@ -69,19 +69,19 @@
           on Save() / SavePatch() / SaveCompressed() / LoadSession(), driven by a
           per-store `SerializationManifest` (with per-session overrides available too).
         - BufferArray utility for compact typed numeric arrays.
+        - Smart Rate Limiter: budget-aware priority queue over DataStore calls
+          (Critical lock/release > High Save > Normal reads > Low auto-patches),
+          live GetRequestBudgetForRequestType gating, per-key patch coalescing,
+          and configurable concurrency / reserve / queue wait.
 
     Built with time, effort, love, and passion for the Roblox Developer Community <3.
 
     Github(repository):
     https://github.com/draxxordev/PersonaStore
 
-    v.1.3.0 [7/27/2026]
+    v.1.4.0 [7/28/2026]
     By @Draxxor
 ]]--
-
---// Types
-export type table =
-	{ [string]: any } | { [number]: any } | { table }
 
 --// Services
 local DataStoreService = game:GetService("DataStoreService")
@@ -117,6 +117,24 @@ local PersonaStore = {
 	--                            tracked in a FieldHashes table. Cheap even with huge sibling fields
 	--                            (e.g. a 50,000-item Inventory) as long as those fields stay clean.
 	IntegrityMode = "Full",
+
+	-- Rate limiting (smart request budget management)
+	-- Uses DataStoreService:GetRequestBudgetForRequestType when available,
+	-- plus an internal priority queue so critical ops (lock acquire, release,
+	-- full Save on leave/BindToClose) always run ahead of background patches.
+	EnableRateLimiter = true,
+	-- Keep this many budget tokens in reserve so a sudden player join/leave
+	-- wave never starves. Background (Low) requests wait when budget is at
+	-- or below this floor.
+	RateLimiterBudgetReserve = 5,
+	-- Max simultaneous in-flight DataStore calls from this server.
+	RateLimiterMaxConcurrent = 8,
+	-- Minimum seconds between SavePatch / auto-save attempts on the *same*
+	-- session key (coalesces rapid dirty writes). Full Save / Release ignore this.
+	RateLimiterMinPatchInterval = 8,
+	-- Soft cap on how long a Low-priority request will wait in the queue
+	-- before giving up (seconds). High/Critical never give up for budget alone.
+	RateLimiterMaxQueueWait = 30,
 }
 
 --// Constants (DO NOT TOUCH UNLESS YOU KNOW WHAT YOU'RE DOING!)
@@ -500,29 +518,274 @@ local function profileRaw(elapsed: number): table
 	}
 end
 
--- Resilient wrapper around DataStoreService calls with retry logic
-local function withRetry(attemptFn: () -> any, maxAttempts: number?): (boolean, any)
+--// Rate Limiter
+-- Priority levels (higher number = more important):
+--   3 Critical  – lock acquire, Release, BindToClose full save
+--   2 High      – explicit Save / SaveCompressed / IncrementCounter
+--   1 Normal    – LoadReadOnly, GetKeyMetadata, Verify, versions
+--   0 Low       – auto-save SavePatch, background coalesced writes
+--
+-- Request kinds map to DataStoreService budgets when available.
+local RateLimiter = {
+	_inFlight = 0,
+	_queue = {}, -- array of {priority, kind, resolve, reject, enqueuedAt}
+	_pumpRunning = false,
+	_lastPatchAt = {}, -- key -> os.clock() for per-key patch coalescing
+	_stats = {
+		Queued = 0,
+		BudgetWaits = 0,
+		CoalescedPatches = 0,
+		DroppedLowPriority = 0,
+	},
+}
+
+local PRIORITY = {
+	Critical = 3,
+	High = 2,
+	Normal = 1,
+	Low = 0,
+}
+
+-- Best-effort mapping from our logical "kind" to Enum.DataStoreRequestType.
+-- Falls back gracefully if an enum item is missing on older clients.
+local function resolveBudgetEnum(kind: string): Enum.DataStoreRequestType?
+	local RT = Enum.DataStoreRequestType
+	if kind == "Update" then
+		-- UpdateAsync burns both read and write; prefer StandardWrite if present,
+		-- else UpdateAsync / SetIncrementAsync style names.
+		return (RT :: any).StandardWrite
+			or (RT :: any).UpdateAsync
+			or (RT :: any).SetIncrementAsync
+	elseif kind == "Read" then
+		return (RT :: any).StandardRead
+			or (RT :: any).GetAsync
+	elseif kind == "OrderedWrite" then
+		return (RT :: any).OrderedWrite
+			or (RT :: any).SetIncrementSortedAsync
+	elseif kind == "OrderedRead" then
+		return (RT :: any).OrderedRead
+			or (RT :: any).GetAsync
+	elseif kind == "OrderedList" then
+		return (RT :: any).OrderedList
+			or (RT :: any).GetSortedAsync
+	elseif kind == "List" or kind == "Version" then
+		return (RT :: any).StandardList
+			or (RT :: any).ListAsync
+			or (RT :: any).GetVersionAsync
+	end
+	return nil
+end
+
+local function getLiveBudget(kind: string): number?
+	local enumItem = resolveBudgetEnum(kind)
+	if not enumItem then
+		return nil
+	end
+	local ok, budget = pcall(function()
+		return DataStoreService:GetRequestBudgetForRequestType(enumItem)
+	end)
+	if ok and type(budget) == "number" then
+		return budget
+	end
+	return nil
+end
+
+local function budgetAllows(kind: string, priority: number): boolean
+	if not PersonaStore.EnableRateLimiter then
+		return true
+	end
+	local budget = getLiveBudget(kind)
+	if budget == nil then
+		-- Budget API unavailable (Studio edge cases, etc.) — allow through.
+		return true
+	end
+	local reserve = PersonaStore.RateLimiterBudgetReserve or 5
+	if priority >= PRIORITY.High then
+		-- Critical / High may dip into the reserve.
+		return budget > 0
+	end
+	return budget > reserve
+end
+
+local function insertByPriority(entry)
+	local q = RateLimiter._queue
+	local inserted = false
+	for i = 1, #q do
+		if entry.priority > q[i].priority then
+			table.insert(q, i, entry)
+			inserted = true
+			break
+		end
+	end
+	if not inserted then
+		table.insert(q, entry)
+	end
+	RateLimiter._stats.Queued += 1
+end
+
+local function pumpQueue()
+	if RateLimiter._pumpRunning then
+		return
+	end
+	RateLimiter._pumpRunning = true
+
+	task.spawn(function()
+		while #RateLimiter._queue > 0 or RateLimiter._inFlight > 0 do
+			local maxConcurrent = PersonaStore.RateLimiterMaxConcurrent or 8
+			local advanced = false
+
+			while #RateLimiter._queue > 0 and RateLimiter._inFlight < maxConcurrent do
+				local entry = RateLimiter._queue[1]
+
+				-- Drop Low-priority items that have waited too long.
+				if entry.priority <= PRIORITY.Low then
+					local waited = os.clock() - entry.enqueuedAt
+					local maxWait = PersonaStore.RateLimiterMaxQueueWait or 30
+					if waited > maxWait then
+						table.remove(RateLimiter._queue, 1)
+						RateLimiter._stats.DroppedLowPriority += 1
+						entry.resolve(false, "RateLimiter: Low-priority request timed out in queue")
+						advanced = true
+						continue
+					end
+				end
+
+				if not budgetAllows(entry.kind, entry.priority) then
+					RateLimiter._stats.BudgetWaits += 1
+					break -- Wait for budget to recover; don't starve higher items forever.
+				end
+
+				table.remove(RateLimiter._queue, 1)
+				RateLimiter._inFlight += 1
+				advanced = true
+
+				task.spawn(function()
+					local ok, result = entry.attemptFn()
+					RateLimiter._inFlight -= 1
+					entry.resolve(ok, result)
+					-- Nudge the pump in case budget/concurrency freed a slot.
+					pumpQueue()
+				end)
+			end
+
+			if not advanced then
+				task.wait(0.15)
+			end
+		end
+		RateLimiter._pumpRunning = false
+	end)
+end
+
+-- Enqueue a rate-limited operation. Returns (success, result) like withRetry.
+-- `kind` is one of: "Update" | "Read" | "OrderedWrite" | "OrderedRead" | "OrderedList" | "List" | "Version"
+-- `priority` is PRIORITY.Critical / High / Normal / Low
+local function enqueueRateLimited(
+	kind: string,
+	priority: number,
+	attemptFn: () -> (boolean, any),
+	maxQueueWait: number?
+): (boolean, any)
+	if not PersonaStore.EnableRateLimiter then
+		return attemptFn()
+	end
+
+	-- Fast path: capacity + budget available → run immediately under concurrency slot.
+	local maxConcurrent = PersonaStore.RateLimiterMaxConcurrent or 8
+	if RateLimiter._inFlight < maxConcurrent and budgetAllows(kind, priority) and #RateLimiter._queue == 0 then
+		RateLimiter._inFlight += 1
+		local ok, result = attemptFn()
+		RateLimiter._inFlight -= 1
+		pumpQueue()
+		return ok, result
+	end
+
+	local bindable = Instance.new("BindableEvent")
+	local storedOk, storedResult
+	local entry = {
+		priority = priority,
+		kind = kind,
+		enqueuedAt = os.clock(),
+		attemptFn = attemptFn,
+		resolve = function(ok, result)
+			storedOk, storedResult = ok, result
+			bindable:Fire()
+		end,
+	}
+	insertByPriority(entry)
+	pumpQueue()
+
+	local waitCap = maxQueueWait or (priority <= PRIORITY.Low and (PersonaStore.RateLimiterMaxQueueWait or 30) or 120)
+	bindable.Event:Wait()
+	bindable:Destroy()
+	-- If somehow never resolved (shouldn't happen), treat as failure.
+	if storedOk == nil then
+		return false, "RateLimiter: request never resolved"
+	end
+	return storedOk, storedResult
+end
+
+-- Per-key patch coalescing: returns true if this patch should be skipped
+-- because a recent one already went out (or is in flight conceptually).
+local function shouldCoalescePatch(sessionKey: string): boolean
+	if not PersonaStore.EnableRateLimiter then
+		return false
+	end
+	local minInterval = PersonaStore.RateLimiterMinPatchInterval or 8
+	local last = RateLimiter._lastPatchAt[sessionKey]
+	if last and (os.clock() - last) < minInterval then
+		RateLimiter._stats.CoalescedPatches += 1
+		return true
+	end
+	return false
+end
+
+local function markPatchSent(sessionKey: string)
+	RateLimiter._lastPatchAt[sessionKey] = os.clock()
+end
+
+-- Resilient wrapper around DataStoreService calls with retry logic.
+-- When `kind` + `priority` are supplied, the whole retry loop is scheduled
+-- through the rate limiter (budget + concurrency + priority queue).
+local function withRetry(
+	attemptFn: () -> any,
+	maxAttempts: number?,
+	kind: string?,
+	priority: number?
+): (boolean, any)
 	local attempts = maxAttempts or 5
 	local lastError = nil
 
-	for attemptIndex = 1, attempts do
-		PersonaStore._statistics.DatastoreRequestsAttempted += 1
-		local success, result = pcall(attemptFn)
-		if success then
-			return true, result
-		end
+	local function runAttempts(): (boolean, any)
+		for attemptIndex = 1, attempts do
+			PersonaStore._statistics.DatastoreRequestsAttempted += 1
+			local success, result = pcall(attemptFn)
+			if success then
+				return true, result
+			end
 
-		lastError = result
-		PersonaStore._statistics.DatastoreRequestsFailed += 1
+			lastError = result
+			PersonaStore._statistics.DatastoreRequestsFailed += 1
 
-		if attemptIndex < attempts then
-			task.wait(
-				math.min(2 ^ attemptIndex, 16) + (math.random() * 0.5)
-			)
+			-- Detect throttle-style errors and back off harder.
+			local errStr = tostring(result)
+			local isThrottle = string.find(errStr, "302")
+				or string.find(errStr, "[Tt]hrottl")
+				or string.find(errStr, "429")
+				or string.find(errStr, "Budget")
+
+			if attemptIndex < attempts then
+				local base = isThrottle and (2 ^ (attemptIndex + 1)) or (2 ^ attemptIndex)
+				task.wait(math.min(base, 20) + (math.random() * 0.5))
+			end
 		end
+		return false, lastError
 	end
 
-	return false, lastError
+	if kind and PersonaStore.EnableRateLimiter then
+		return enqueueRateLimited(kind, priority or PRIORITY.Normal, runAttempts)
+	end
+
+	return runAttempts()
 end
 
 --// Class DataSession
@@ -715,7 +978,7 @@ function DataSession:Save(): boolean
 
 			return currentRaw
 		end)
-	end)
+	end, 5, "Update", PRIORITY.High)
 
 	if success then
 		self._metadata.LastSaved = os.time()
@@ -735,6 +998,8 @@ end
 --   "Full"               -> rehashes everything on every patch (old behavior, expensive).
 --   "HashOnlyOnFullSave"  -> skips hashing entirely; DataHash only advances on Save().
 --   "PerField"            -> only rehashes the fields that were actually dirtied.
+-- Rate-limited as Low priority + per-key coalescing so rapid dirty writes don't
+-- burn the DataStore budget.
 function DataSession:SavePatch(): boolean
 	if self._isReleased then return false end
 
@@ -745,6 +1010,11 @@ function DataSession:SavePatch(): boolean
 	end
 
 	if #dirtyKeys == 0 then
+		return true
+	end
+
+	if shouldCoalescePatch(self._key) then
+		-- Still dirty; next auto-save / explicit Save will pick it up.
 		return true
 	end
 
@@ -801,9 +1071,10 @@ function DataSession:SavePatch(): boolean
 
 			return currentRaw
 		end)
-	end)
+	end, 5, "Update", PRIORITY.Low)
 
 	if success then
+		markPatchSent(self._key)
 		self._metadata.LastSaved = os.time()
 		self._metadata.WriteCycles += 1
 		self._dirtyFields = {}
@@ -879,7 +1150,7 @@ function DataSession:SaveCompressed(): boolean
 
 			return currentRaw
 		end)
-	end)
+	end, 5, "Update", PRIORITY.High)
 
 	if success then
 		self._metadata.LastSaved = os.time()
@@ -923,7 +1194,7 @@ end
 function DataSession:IsCacheStale(): boolean
 	local success, remoteRaw = withRetry(function()
 		return self._storeRef._storageInstance:GetAsync(self._key)
-	end, 3)
+	end, 3, "Read", PRIORITY.Normal)
 
 	if not success or not remoteRaw then
 		return false
@@ -947,7 +1218,7 @@ function DataSession:VerifyDataIntegrity(): boolean
 
 	local success, remoteRaw = withRetry(function()
 		return self._storeRef._storageInstance:GetAsync(self._key)
-	end, 3)
+	end, 3, "Read", PRIORITY.Normal)
 
 	if not success or not remoteRaw then
 		return false
@@ -1111,7 +1382,7 @@ function DataSession:Release()
 
 			return currentRaw
 		end)
-	end, 3)
+	end, 3, "Update", PRIORITY.Critical)
 end
 
 -- Convenience alias: a full teardown that always saves first
@@ -1211,7 +1482,7 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 
 			return currentRaw
 		end)
-	end)
+	end, 5, "Update", PRIORITY.Critical)
 
 	if not success then
 		warn("[Founder]: Failed to acquire session lock for key: " .. key .. " -> " .. tostring(err))
@@ -1260,7 +1531,7 @@ end
 function Founder:LoadReadOnlySnapshot<T>(key: string): table?
 	local success, data = withRetry(function()
 		return self._storageInstance:GetAsync(key)
-	end, 3)
+	end, 3, "Read", PRIORITY.Normal)
 
 	if not success or not data then
 		return nil
@@ -1301,7 +1572,7 @@ function Founder:PublishGlobalUpdate(key: string, payload: table): boolean
 
 			return currentRaw
 		end)
-	end)
+	end, 5, "Update", PRIORITY.Normal)
 
 	-- We wrap it in a real function, and keep it a single best-effort attempt.
 	withRetry(function()
@@ -1360,7 +1631,7 @@ end
 function Founder:GetKeyMetadata(key: string): table?
 	local success, data = withRetry(function()
 		return self._storageInstance:GetAsync(key)
-	end, 3)
+	end, 3, "Read", PRIORITY.Normal)
 
 	if not success or not data then
 		return nil
@@ -1406,7 +1677,7 @@ function Founder:ListVersionsAsync(key: string, sortDirection: Enum.SortDirectio
 			maxDate,
 			pageSize or 50
 		)
-	end, 3)
+	end, 3, "Version", PRIORITY.Normal)
 
 	if not success then
 		warn("[Founder]: ListVersionsAsync failed for key: " .. key .. " -> " .. tostring(pages))
@@ -1422,7 +1693,7 @@ end
 function Founder:GetVersionAsync(key: string, version: string): table?
 	local success, data = withRetry(function()
 		return self._storageInstance:GetVersionAsync(key, version)
-	end, 3)
+	end, 3, "Version", PRIORITY.Normal)
 
 	if not success or not data then
 		warn("[Founder]: GetVersionAsync failed for key: " .. key .. " version: " .. tostring(version) .. " -> " .. tostring(data))
@@ -1442,7 +1713,7 @@ function Founder:RemoveVersionAsync(key: string, version: string): boolean
 	local success, err = withRetry(function()
 		self._storageInstance:RemoveVersionAsync(key, version)
 		return true
-	end, 3)
+	end, 3, "Version", PRIORITY.High)
 
 	if not success then
 		warn("[Founder]: RemoveVersionAsync failed for key: " .. key .. " version: " .. tostring(version) .. " -> " .. tostring(err))
@@ -1481,7 +1752,7 @@ function OrderedFounder:Set(key: string, value: number): boolean
 	local success = withRetry(function()
 		self._storageInstance:SetAsync(key, value)
 		return true
-	end)
+	end, 5, "OrderedWrite", PRIORITY.High)
 
 	return success == true
 end
@@ -1490,7 +1761,7 @@ end
 function OrderedFounder:Get(key: string): number?
 	local success, value = withRetry(function()
 		return self._storageInstance:GetAsync(key)
-	end, 3)
+	end, 3, "OrderedRead", PRIORITY.Normal)
 
 	if not success then
 		return nil
@@ -1503,7 +1774,7 @@ end
 function OrderedFounder:Increment(key: string, delta: number?): number?
 	local success, result = withRetry(function()
 		return self._storageInstance:IncrementAsync(key, delta or 1)
-	end)
+	end, 5, "OrderedWrite", PRIORITY.High)
 
 	if not success then
 		return nil
@@ -1517,14 +1788,14 @@ function OrderedFounder:Remove(key: string): boolean
 	local success = withRetry(function()
 		self._storageInstance:RemoveAsync(key)
 		return true
-	end, 3)
+	end, 3, "OrderedWrite", PRIORITY.High)
 
 	return success == true
 end
 
 -- Fetches one sorted page of entries. Returns the current page ({key, value} entries)
 -- plus the raw DataStorePages object (for pagination via :AdvanceToNextPageAsync()).
-function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, minValue: number?, maxValue: number?): DataStorePages?
+function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, minValue: number?, maxValue: number?): (any, DataStorePages)
 	if pageSize and (pageSize < 1 or pageSize > 100) then
 		warn("[OrderedFounder]: pageSize must be between 1 and 100 for store: " .. self._storeName)
 		return nil, nil
@@ -1532,7 +1803,7 @@ function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, mi
 
 	local success, pages = withRetry(function()
 		return self._storageInstance:GetSortedAsync(ascending or false, pageSize or 50, minValue, maxValue)
-	end, 3)
+	end, 3, "OrderedList", PRIORITY.Normal)
 
 	if not success then
 		warn("[OrderedFounder]: GetSortedAsync failed for store: " .. self._storeName .. " -> " .. tostring(pages))
@@ -1540,6 +1811,7 @@ function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, mi
 	end
 
 	local currentPage = pages:GetCurrentPage()
+
 	return currentPage, pages
 end
 
@@ -1905,10 +2177,11 @@ function PersonaStore:Init(settings: PersonaStoreSettings?)
 		warn("[PersonaStore]: Init() called more than once!")
 		return
 	end
-	
+
 	if settings and settings ~= {} then
 		for k, v in settings do
-			if PersonaStore[k] then
+			-- Use ~= nil so boolean false settings (e.g. EnableRateLimiter = false) apply.
+			if PersonaStore[k] ~= nil then
 				PersonaStore[k] = v
 			else
 				error("[PersonaStore]: Invalid setting key '" .. tostring(k) .. "'")
@@ -1971,9 +2244,59 @@ function PersonaStore:Init(settings: PersonaStoreSettings?)
 	print("[PersonaStore]: Engine started successfully!")
 end
 
--- Get engine-wide statistics
+-- Get engine-wide statistics (includes rate-limiter counters when enabled)
 function PersonaStore:GetStatistics(): table
-	return deepCopy(PersonaStore._statistics)
+	local stats = deepCopy(PersonaStore._statistics)
+	stats.RateLimiter = {
+		InFlight = RateLimiter._inFlight,
+		Queued = #RateLimiter._queue,
+		QueuedTotal = RateLimiter._stats.Queued,
+		BudgetWaits = RateLimiter._stats.BudgetWaits,
+		CoalescedPatches = RateLimiter._stats.CoalescedPatches,
+		DroppedLowPriority = RateLimiter._stats.DroppedLowPriority,
+		EnableRateLimiter = PersonaStore.EnableRateLimiter,
+	}
+	return stats
+end
+
+-- Live snapshot of the rate limiter (queue depth, budgets, etc.)
+function PersonaStore:GetRateLimiterStatus(): table
+	local status = {
+		Enabled = PersonaStore.EnableRateLimiter,
+		InFlight = RateLimiter._inFlight,
+		QueueDepth = #RateLimiter._queue,
+		MaxConcurrent = PersonaStore.RateLimiterMaxConcurrent,
+		BudgetReserve = PersonaStore.RateLimiterBudgetReserve,
+		MinPatchInterval = PersonaStore.RateLimiterMinPatchInterval,
+		Stats = deepCopy(RateLimiter._stats),
+		Budgets = {},
+	}
+	for _, kind in ipairs({ "Update", "Read", "OrderedWrite", "OrderedRead", "OrderedList", "Version" }) do
+		status.Budgets[kind] = getLiveBudget(kind)
+	end
+	return status
+end
+
+-- Toggle / retune the rate limiter at runtime (after Init)
+function PersonaStore:SetRateLimiterSettings(settings: table)
+	if type(settings) ~= "table" then
+		return
+	end
+	if settings.EnableRateLimiter ~= nil then
+		PersonaStore.EnableRateLimiter = settings.EnableRateLimiter
+	end
+	if settings.BudgetReserve ~= nil then
+		PersonaStore.RateLimiterBudgetReserve = math.max(0, settings.BudgetReserve)
+	end
+	if settings.MaxConcurrent ~= nil then
+		PersonaStore.RateLimiterMaxConcurrent = math.max(1, settings.MaxConcurrent)
+	end
+	if settings.MinPatchInterval ~= nil then
+		PersonaStore.RateLimiterMinPatchInterval = math.max(0, settings.MinPatchInterval)
+	end
+	if settings.MaxQueueWait ~= nil then
+		PersonaStore.RateLimiterMaxQueueWait = math.max(1, settings.MaxQueueWait)
+	end
 end
 
 -- Configure compression settings
@@ -2032,7 +2355,10 @@ if not guardSuccess then
 	error("[PersonaStore]: " .. tostring(guardErr))
 end
 
---// Final Exports for autocomplete
+--// Type definitions for Luau type checking
+export type table =
+	{ [string]: any } | { [number]: any } | { table }
+
 export type PersonaStoreSettings = {
 	CompressionAlgorithm: Enum.CompressionAlgorithm?, -- default Zstd
 	CompressionLevel: number?, -- default 6
@@ -2040,7 +2366,13 @@ export type PersonaStoreSettings = {
 	HashAlgorithm: Enum.HashAlgorithm?, -- default sha256
 	IntegrityMode: "Full" | "HashOnlyOnFullSave" | "PerField"?, -- default Full
 	GlobalLockTimeout: number?, -- default 120 (seconds)
-	GlobalAutoSaveInterval: number?, -- default 30 (seconds) 
+	GlobalAutoSaveInterval: number?, -- default 30 (seconds)
+	-- Rate limiter
+	EnableRateLimiter: boolean?, -- default true
+	RateLimiterBudgetReserve: number?, -- default 5 (leave headroom for Critical/High)
+	RateLimiterMaxConcurrent: number?, -- default 8
+	RateLimiterMinPatchInterval: number?, -- default 8 seconds between patches per key
+	RateLimiterMaxQueueWait: number?, -- default 30 seconds for Low priority
 }
 
 export type MemoryQueueWrapper = typeof(MemoryQueueWrapper)
