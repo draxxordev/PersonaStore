@@ -5,6 +5,65 @@ This project follows **Semantic Versioning** (`MAJOR.MINOR.PATCH`).
 
 ---
 
+# v1.3.0
+
+## Added
+*Serialization Engine & BufferArray utility*
+
+### Serialization Engine
+- New global serializer registry, pre-populated with built-in support for `Vector3`, `Vector2`, `CFrame`, `Color3`, `UDim`, and `UDim2`.
+- `PersonaStore:RegisterSerializer(typeName, serializer)` to register custom (de)serializers for your own types (e.g. a `Currency` or `Item` struct), where `serializer` is a table of `{Serialize = function(value) -> storageSafeData, Deserialize = function(data) -> value}`.
+- New `SerializationManifest` config option on `Founder.new()` / `PersonaStore:CreateDataStore()` — a `{fieldName = typeName, ...}` table applied automatically to every session loaded from that store.
+- `DataSession:SetSerialize(manifest)` — replaces the session's manifest wholesale. Sessions inherit a deep copy of the store's `SerializationManifest` by default, so calling this only affects that one session.
+- `DataSession:MarkFieldSerialized(fieldName, typeName)` — adds or overrides a single field's manifest entry without replacing the rest of the manifest.
+- `DataSession:Serialize(value, typeName?)` / `DataSession:Deserialize(value)` — manual (de)serialization helpers for one-off conversions outside the manifest. `Serialize()` auto-detects known Roblox types via `typeof()` when `typeName` is omitted, and recurses into plain tables so nested typed values (e.g. an array of `CFrame`s) are converted too.
+- Manifest-marked fields are automatically converted to storage-safe form immediately before `Save()`, `SavePatch()`, `SaveCompressed()`, and `ExportData()` write/hash their data, and converted back immediately after `LoadSession()`, `LoadReadOnlySnapshot()`, `GetVersionAsync()`, and `ImportData()` read theirs.
+- `PersonaStore.SerializeValue` / `PersonaStore.DeserializeValue` exposed on the module table for use without a live session, e.g. `PersonaStore.SerializeValue(myVector, "Vector3")`.
+
+### BufferArray
+- New `BufferArray` utility class: a thin, typed wrapper over Luau `buffer` for compact numeric arrays. Supports `u8`/`i8`/`u16`/`i16`/`u32`/`i32`/`u64`/`i64`/`f32`/`f64` element types.
+- `BufferArray.new(elementType, elementCount)` to create a new fixed-size typed array.
+- `:Get(index)` / `:Set(index, value)` for single-element access (0-based indexing).
+- `:GetRange(startIndex, length)` / `:SetRange(startIndex, values)` for bulk reads/writes.
+- `:Fill(value)` to fill every element with the same value.
+- `:GetBuffer()` for direct raw `buffer` access, `:GetMetadata()` for element type/size/count/total-size info.
+- `:EncodeToBase64()` and the static `BufferArray.DecodeFromBase64(elementType, encoded)` for round-tripping a `BufferArray` through a DataStore-safe string field.
+- Exposed as `PersonaStore.BufferArray`.
+
+## Changed
+- N/A
+
+## Fixed
+- **`BufferArray:Get()` / `:Set()` indexed the buffer as if it were a table.** The original implementation attempted `self._buffer[self._readMethod](...)`, but a Luau `buffer` isn't indexable or callable that way — the reader/writer functions (`buffer.readu8`, `buffer.writeu8`, etc.) live on the global `buffer` library, not on the buffer value itself. Fixed to call through the `buffer` library directly, e.g. `buffer.readu8(self._buffer, offset)`.
+
+---
+
+### Migration Notes for v1.2.0 → v1.3.0
+**100% Backward Compatible** — no breaking changes. `SerializationManifest` defaults to `{}` and `BufferArray` is purely additive; every existing store/session behaves exactly as before unless you opt in:
+
+```lua
+-- v1.2.0 code continues to work exactly as before
+session:SavePatch()
+
+-- Opt in to automatic Vector3/CFrame/etc. (de)serialization for a store
+local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v2", {
+    Schema = PlayerTemplate,
+    SerializationManifest = {
+        LastPosition = "Vector3",
+        SpawnCFrame = "CFrame",
+    },
+})
+
+-- ...or per-session
+session:MarkFieldSerialized("LastPosition", "Vector3")
+
+-- New BufferArray utility is additive
+local scores = PersonaStore.BufferArray.new("u32", 1000)
+scores:Set(0, 4200)
+```
+
+---
+
 # v1.2.0
 
 ## Added
