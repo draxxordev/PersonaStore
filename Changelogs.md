@@ -558,6 +558,13 @@ If you were previously relying on `VerifyDataIntegrity()` returning `false` in n
 ## Removed
 - N/A
 
+## Performance
+
+- Automatic serialization only processes fields listed in the SerializationManifest.
+- Unlisted fields bypass the serializer completely.
+- BufferArray stores numeric collections in compact binary form, reducing DataStore payload sizes.
+- Serialization occurs immediately before hashing/compression, avoiding unnecessary work during gameplay.
+
 ### Migration Notes for v1.0.0 → v1.1.0
 **100% Backward Compatible** - No breaking changes. Existing code continues to work without modification.
 
