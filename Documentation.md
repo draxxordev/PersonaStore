@@ -14,8 +14,10 @@ PersonaStore is a robust, production-ready DataStore persistence framework with 
 8. [OrderedDataStore Support](#ordereddatastore-support)
 9. [MemoryStoreService Support](#memorystoreservice-support)
 10. [DataStore Version APIs](#datastore-version-apis)
-11. [Statistics & Monitoring](#statistics--monitoring)
-12. [Advanced Features](#advanced-features)
+11. [Serialization Engine](#serialization-engine)
+12. [BufferArray Utility](#bufferarray-utility)
+13. [Statistics & Monitoring](#statistics--monitoring)
+14. [Advanced Features](#advanced-features)
 
 ---
 
@@ -105,6 +107,7 @@ local PlayerStore = PersonaStore:CreateDataStore("PlayerData", {
 |-------|------|---------|-------------|
 | `Schema` | `table` | `{}` | Template for new profiles |
 | `AutoSaveInterval` | `number` | `30` | Seconds between autosaves |
+| `SerializationManifest` | `table` | `{}` | `{fieldName = typeName, ...}` applied to every session loaded from this store — see [Serialization Engine](#serialization-engine) |
 
 ---
 
@@ -164,6 +167,28 @@ local Leaderboard = PersonaStore:CreateOrderedDataStore("WeeklyLeaderboard_v1")
 local PurchaseQueue = PersonaStore:CreateMemoryQueue("PendingPurchases")
 local ActiveMatches = PersonaStore:CreateMemorySortedMap("ActiveMatches")
 ```
+
+---
+
+#### PersonaStore:RegisterSerializer(typeName, serializer)
+
+**NEW in v1.3.0** — Registers a custom (de)serializer for a type name, making it usable in a `Founder`'s `SerializationManifest`, a session's `SetSerialize()` / `MarkFieldSerialized()`, or passed explicitly to `DataSession:Serialize(value, typeName)`. See [Serialization Engine](#serialization-engine).
+
+```lua
+PersonaStore:RegisterSerializer("Currency", {
+    Serialize = function(c) return {Amount = c.Amount, Kind = c.Kind} end,
+    Deserialize = function(d) return Currency.new(d.Amount, d.Kind) end,
+})
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `typeName` | `string` | Name used to reference this type elsewhere (e.g. in a manifest) |
+| `serializer` | `table` | `{Serialize = function(value) -> storageSafeData, Deserialize = function(data) -> value}` |
+
+**Returns:** `boolean` — `false` (with a `warn()`) if `serializer` doesn't have both functions
+
+`Vector3`, `Vector2`, `CFrame`, `Color3`, `UDim`, and `UDim2` are already registered out of the box; you only need this for your own custom types.
 
 ---
 
@@ -249,7 +274,7 @@ end
 |-----------|------|----------|-------------|
 | `key` | `string` | Yes | Profile key |
 
-**Returns:** `table?` — The profile data, or `nil` if not found. Compressed profiles are transparently decompressed before being returned.
+**Returns:** `table?` — The profile data, or `nil` if not found. Compressed profiles are transparently decompressed before being returned, and any `SerializationManifest`-marked fields are converted back to real Vector3/CFrame/etc. objects.
 
 **Use cases:**
 - Leaderboard queries without locking the player
@@ -371,7 +396,7 @@ print("Active sessions:", count)
 
 #### Founder:GetVersionAsync(key, version)
 
-**NEW in v1.2.0** — See [DataStore Version APIs](#datastore-version-apis).
+**NEW in v1.2.0** — See [DataStore Version APIs](#datastore-version-apis). As of v1.3.0, returned `Data` also has any `SerializationManifest`-marked fields converted back to real Vector3/CFrame/etc. objects, the same as `LoadSession()` / `LoadReadOnlySnapshot()`.
 
 ---
 
@@ -413,6 +438,7 @@ local success = session:Save()
 - Costs more bandwidth than `SavePatch()`
 - Confirms lock token before writing
 - Recomputes both the whole-profile `DataHash` and the per-field `FieldHashes` table, regardless of the current `IntegrityMode` — a full save always re-establishes a clean baseline
+- Any fields marked in the session's `SerializationManifest` are converted to storage-safe form before being written and hashed
 - Use for important checkpoints
 
 ---
@@ -432,6 +458,7 @@ session:SavePatch()
 - Dramatically reduces bandwidth on large profiles
 - Prefer over `Save()` for routine autosaving
 - The cost of the integrity hash pass depends on `PersonaStore.IntegrityMode` — see [Integrity Modes](#integrity-modes)
+- Manifest-marked fields among the dirty fields are serialized before being written and hashed, same as `Save()`
 
 ---
 
@@ -451,6 +478,8 @@ local success = session:SaveCompressed()
 - Reducing storage costs
 
 **Compression ratio:** Typically 40-70% depending on data structure and algorithm
+
+**Note:** Manifest-marked fields are serialized before JSON-encoding, since `HttpService:JSONEncode` can't handle Vector3/CFrame/etc. directly.
 
 ---
 
@@ -545,6 +574,8 @@ local json = session:ExportData(true)
   "Metadata": { /* session metadata */ }
 }
 ```
+
+**Note:** Manifest-marked fields are serialized into the export, so `Data` is plain, JSON-safe data. `ImportData()` reverses this automatically.
 
 ---
 
@@ -700,6 +731,57 @@ print("Compression stats:", meta.CompressionStats)
 | `WriteCycles` | `number` | Count of `Save()` / `SavePatch()` calls |
 | `LastModified` | `number?` | Unix timestamp of last data mutation |
 | `CompressionStats` | `table` | Latest compression stats |
+
+---
+
+#### DataSession:SetSerialize(manifest)
+
+**NEW in v1.3.0** — Replaces this session's serialization manifest wholesale. See [Serialization Engine](#serialization-engine).
+
+```lua
+session:SetSerialize({
+    Position = "Vector3",
+    SpawnCFrame = "CFrame",
+})
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `manifest` | `table` | Yes | `{fieldName = typeName, ...}` |
+
+**Returns:** `boolean` — `false` (with a `warn()`) if `manifest` isn't a table
+
+**Note:** This *replaces* the whole manifest, including whatever the session inherited from the store's `SerializationManifest` config. Use `MarkFieldSerialized()` instead if you just want to add one field.
+
+---
+
+#### DataSession:MarkFieldSerialized(fieldName, typeName)
+
+**NEW in v1.3.0** — Adds or overrides a single field in this session's serialization manifest without touching the rest.
+
+```lua
+session:MarkFieldSerialized("LastPosition", "Vector3")
+```
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `fieldName` | `string` | Yes | Top-level field name in `Data` |
+| `typeName` | `string` | Yes | Registered type name (e.g. `"Vector3"`, or a custom type from `RegisterSerializer`) |
+
+**Returns:** `boolean` — `false` if either argument is missing
+
+---
+
+#### DataSession:Serialize(value, typeName?) / DataSession:Deserialize(value)
+
+**NEW in v1.3.0** — Manual (de)serialization helpers, independent of the manifest. Useful for one-off conversions, e.g. before sending data over `PublishGlobalUpdate()`.
+
+```lua
+local safePosition = session:Serialize(player.Character.HumanoidRootPart.Position, "Vector3")
+local realPosition = session:Deserialize(safePosition)
+```
+
+`Serialize()` auto-detects known Roblox types via `typeof()` when `typeName` is omitted, and recurses into plain tables so nested typed values are converted too.
 
 ---
 
@@ -988,6 +1070,165 @@ PlayerStore:RemoveVersionAsync(tostring(userId), someVersionId)
 
 ---
 
+## Serialization Engine
+
+**NEW in v1.3.0.** Roblox types like `Vector3`, `CFrame`, and `Color3` can't be JSON-encoded, so historically you had to manually convert them to plain tables before every save and back after every load. The serialization engine automates that: mark a field as a given type once, and every save/load path converts it for you.
+
+### Built-in types
+
+`Vector3`, `Vector2`, `CFrame`, `Color3`, `UDim`, and `UDim2` are registered out of the box.
+
+### Marking fields — store-wide
+
+Set `SerializationManifest` when creating a store so every session loaded from it gets the same conversions automatically:
+
+```lua
+local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v2", {
+    Schema = {
+        Coins = 0,
+        LastPosition = Vector3.new(0, 0, 0),
+        SpawnCFrame = CFrame.new(),
+    },
+    SerializationManifest = {
+        LastPosition = "Vector3",
+        SpawnCFrame = "CFrame",
+    },
+})
+
+local session = PlayerStore:LoadSession(tostring(player.UserId))
+
+-- Read/write real Vector3/CFrame objects like normal -- conversion happens
+-- automatically at Save() / SavePatch() / SaveCompressed() time, and is
+-- reversed automatically at LoadSession() time.
+session.Data.LastPosition = player.Character.HumanoidRootPart.Position
+session:SavePatch()
+```
+
+### Marking fields — per session
+
+If only some sessions from a store need a conversion, or you'd rather not touch the store config, use the session-level methods instead:
+
+```lua
+-- Add one field without disturbing the rest of the manifest
+session:MarkFieldSerialized("SpawnCFrame", "CFrame")
+
+-- Or replace the whole manifest for this session
+session:SetSerialize({
+    LastPosition = "Vector3",
+    SpawnCFrame = "CFrame",
+})
+```
+
+### Custom types
+
+Register your own type once (usually at server start, before any `LoadSession()` calls that reference it), then use it in a manifest just like a built-in:
+
+```lua
+PersonaStore:RegisterSerializer("Currency", {
+    Serialize = function(c)
+        return { Amount = c.Amount, Kind = c.Kind }
+    end,
+    Deserialize = function(d)
+        return Currency.new(d.Amount, d.Kind)
+    end,
+})
+
+local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v2", {
+    Schema = { Wallet = Currency.new(0, "Gold") },
+    SerializationManifest = { Wallet = "Currency" },
+})
+```
+
+### Manual (de)serialization
+
+For one-off conversions outside of a manifest — for example, before sending a `Vector3` through `PublishGlobalUpdate()`, which only accepts JSON-safe data:
+
+```lua
+local safePosition = session:Serialize(player.Character.HumanoidRootPart.Position, "Vector3")
+PlayerStore:PublishGlobalUpdate(tostring(targetUserId), {
+    Type = "Teleport",
+    Position = safePosition,
+})
+
+-- On the receiving end:
+session:ListenToGlobalUpdate(function(payload)
+    if payload.Type == "Teleport" then
+        local realPosition = session:Deserialize(payload.Position)
+    end
+end)
+```
+
+`Serialize(value, typeName?)` auto-detects known Roblox types via `typeof()` when `typeName` is omitted, and recurses into plain tables, so nested typed values (e.g. an array of `CFrame`s) are converted correctly too.
+
+### Where conversion happens
+
+| Direction | When |
+|-----------|------|
+| Real object → storage-safe | Immediately before `Save()`, `SavePatch()`, and `SaveCompressed()` write/hash their data; and inside `ExportData()` |
+| Storage-safe → real object | Immediately after `LoadSession()`, `LoadReadOnlySnapshot()`/`LoadReadOnlySession()`, and `GetVersionAsync()` read their data; and inside `ImportData()` |
+
+Because conversion happens right at the read/write boundary, `session.Data` always holds real Vector3/CFrame/etc. objects while you're working with it — you never see the `{__serialized = true, ...}` wrapper form unless you call `Serialize()`/`Deserialize()` manually.
+
+---
+
+## BufferArray Utility
+
+**NEW in v1.3.0.** A thin, typed wrapper over Luau's `buffer` primitive, useful for storing compact numeric data — leaderboard snapshots, grids, particle-ish data — far more cheaply than an equivalent Lua table, then persisting it as a single base64 string field.
+
+### Creating an array
+
+```lua
+-- 1000 unsigned 32-bit integers
+local scores = PersonaStore.BufferArray.new("u32", 1000)
+```
+
+Supported element types: `u8`, `i8`, `u16`, `i16`, `u32`, `i32`, `u64`, `i64`, `f32`, `f64`.
+
+### Reading and writing
+
+```lua
+scores:Set(0, 4200)
+scores:Set(1, 3150)
+
+print(scores:Get(0))  -- 4200
+
+scores:SetRange(0, {4200, 3150, 2800})
+local slice = scores:GetRange(0, 3)  -- {4200, 3150, 2800}
+
+scores:Fill(0)  -- zero out every element
+```
+
+| Method | Description |
+|--------|-------------|
+| `Get(index)` | Reads the element at `index` (0-based) |
+| `Set(index, value)` | Writes `value` at `index` (0-based) |
+| `GetRange(startIndex, length)` | Returns a plain array of `length` elements starting at `startIndex` |
+| `SetRange(startIndex, values)` | Writes a plain array of values starting at `startIndex` |
+| `Fill(value)` | Sets every element to `value` |
+| `GetBuffer()` | Returns the underlying raw `buffer` |
+| `GetMetadata()` | Returns `{ElementType, ElementSize, ElementCount, TotalSize}` |
+
+### Persisting to a DataStore field
+
+`BufferArray` doesn't save itself — encode it to a string and store that string in your profile's `Data` like any other field:
+
+```lua
+-- Save
+session.Data.ScoreSnapshot = scores:EncodeToBase64()
+session:SavePatch()
+
+-- Load
+local restored = PersonaStore.BufferArray.DecodeFromBase64("u32", session.Data.ScoreSnapshot)
+print(restored:Get(0))
+```
+
+**Best for:**
+- Large fixed-size numeric datasets (leaderboard snapshots, heatmaps, tick history)
+- Cases where the per-element overhead of a Lua table (and its JSON encoding) is too expensive
+- Data you're willing to treat as a flat typed array rather than a keyed table
+
+---
+
 ## Statistics & Monitoring
 
 Monitor server health and performance:
@@ -1090,6 +1331,7 @@ session:StartAutoSave(15)
 8. **Monitor statistics:** Track engine health with `GetStatistics()`
 9. **Configure compression:** Tune compression algorithm and level per your data size
 10. **Reach for MemoryStore for ephemeral data:** Don't put short-lived queue/job data in a DataStore-backed profile — use `CreateMemoryQueue`/`CreateMemorySortedMap` instead
+11. **Register custom serializers once, up front:** Call `PersonaStore:RegisterSerializer()` at startup, before any `CreateDataStore()`/`LoadSession()` calls that reference the type in a manifest
 
 ---
 
@@ -1109,9 +1351,13 @@ local PlayerStore = PersonaStore:CreateDataStore("PlayerData_v2", {
         Coins = 0,
         Level = 1,
         Inventory = {},
-        Stats = { Kills = 0, Deaths = 0 }
+        Stats = { Kills = 0, Deaths = 0 },
+        LastPosition = Vector3.new(0, 0, 0)
     },
-    AutoSaveInterval = 30
+    AutoSaveInterval = 30,
+    SerializationManifest = {
+        LastPosition = "Vector3",
+    },
 })
 
 local Leaderboard = PersonaStore:CreateOrderedDataStore("WeeklyLeaderboard_v1")
@@ -1147,6 +1393,7 @@ end)
 Players.PlayerRemoving:Connect(function(player)
     local session = player:GetAttribute("Session")
     if session then
+        session.Data.LastPosition = player.Character.HumanoidRootPart.Position
         session:Destroy()  -- Save and release
     end
 end)
