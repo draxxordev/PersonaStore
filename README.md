@@ -1,6 +1,6 @@
 # PersonaStore
 
-> A ProfileStore-inspired persistence engine for Roblox, built from scratch with an object-oriented architecture, explicit data isolation, session locking, observable state tracking, transactional operations, and cross-server synchronization.
+> A comprehensive Roblox data persistence framework providing session locking, transactional saves, observable data, compression, integrity verification, DataStore versioning, OrderedDataStore utilities, and MemoryStore abstractions through a fully object-oriented API and Luau type checking.
 
 ---
 
