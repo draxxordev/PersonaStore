@@ -66,7 +66,7 @@
     Github(repository):
     https://github.com/draxxordev/PersonaStore
 
-    v.1.2.0 [7/27/2026]
+    v.1.2.1 [7/27/2026]
     By @Draxxor
 ]]--
 
@@ -264,24 +264,27 @@ local function createObservableTable(rawTable: table, changeCallback: (key: stri
 		end
 	end
 
-	setmetatable(proxy, {
-		__index = internalShadow,
-		__newindex = function(_, key, newValue)
-			local effectiveRoot = rootKey or key
+	local mt = {}
 
-			if type(newValue) == "table" then
-				internalShadow[key] = createObservableTable(newValue, changeCallback, effectiveRoot)
-				
-			else
-				internalShadow[key] = newValue
-			end
+	function mt.__index(_, key)
+		return internalShadow[key]
+	end
 
-			changeCallback(key, newValue, effectiveRoot)
-		end,
-		__iter = function()
-			return next, internalShadow, nil
-		end,
-	})
+	function mt.__newindex(_, key, value)
+		if type(value) == "table" then
+			internalShadow[key] = createObservableTable(value, changeCallback, rootKey or key)
+		else
+			internalShadow[key] = value
+		end
+
+		changeCallback(key, value, rootKey or key)
+	end
+
+	function mt.__iter()
+		return next, internalShadow
+	end
+
+	setmetatable(proxy, mt)
 
 	return proxy
 end
@@ -413,7 +416,11 @@ function DataSession:Save(): boolean
 	if self._isReleased then return false end
 
 	local success, err = withRetry(function()
+		print("UpdateAsync attempt", os.clock())
+
 		self._storeRef._storageInstance:UpdateAsync(self._key, function(currentRaw)
+			print("Inside UpdateAsync callback")
+
 			if not currentRaw or currentRaw.SessionToken ~= self._token then
 				error("Ownership mismatch detected; session token has lapsed.")
 			end
@@ -421,7 +428,7 @@ function DataSession:Save(): boolean
 			currentRaw.Data = deepCopy(self.Data)
 			currentRaw.LastUpdate = os.time()
 			currentRaw.Revision = (currentRaw.Revision or 0) + 1
-			
+
 			-- Update metadata after a successful save
 			-- We actually DONT wanna increment this on patch save
 			-- Suppose another server somehow advanced it to 250,
@@ -451,7 +458,7 @@ function DataSession:Save(): boolean
 				OriginalSize = nil,
 				CompressedSize = nil,
 			}
-			
+
 			-- Also clear compressed data when doing uncompressed save
 			currentRaw.CompressedData = nil
 
@@ -533,7 +540,7 @@ function DataSession:SavePatch(): boolean
 				OriginalSize = nil,
 				CompressedSize = nil,
 			}
-			
+
 			-- Also clear compression metadata on patch save
 			currentRaw.CompressedData = nil
 
@@ -819,7 +826,7 @@ function DataSession:Release()
 	--// NOTE
 	--// You would usually want to make this asynchronous by wrapping
 	-- it in a task.spawn() call, but for simplicity we'll keep it
-	-- synchronous here. 
+	-- synchronous here.
 	withRetry(function()
 		self._storeRef._storageInstance:UpdateAsync(self._key, function(currentRaw)
 			if not currentRaw or currentRaw.SessionToken ~= self._token then return nil end
@@ -880,12 +887,18 @@ function Founder:LoadSession<T>(key: string): DataSession<T>
 	local currentJobId = game.JobId ~= "" and game.JobId or "StudioInstance"
 	local activeSessionObject = nil
 
-	withRetry(MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
-		Action = "Eject_Key",
-		TargetStore = self._storeName,
-		TargetKey = key,
-		OriginJobId = currentJobId,
-	}))
+	-- This publish is a best-effort hint so other servers release the lock a
+	-- little sooner; UpdateAsync's own lock-timeout check below is the real
+	-- correctness guarantee, so on failure (e.g. MessagingService throttling,
+	-- which is easy to hit in Studio) we don't want to retry-storm over it.
+	withRetry(function()
+		MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
+			Action = "Eject_Key",
+			TargetStore = self._storeName,
+			TargetKey = key,
+			OriginJobId = currentJobId,
+		})
+	end, 1)
 
 	local success, err = withRetry(function()
 		self._storageInstance:UpdateAsync(key, function(currentRaw)
@@ -994,24 +1007,30 @@ function Founder:PublishGlobalUpdate(key: string, payload: table): boolean
 		end)
 	end)
 
-	withRetry(MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
-		Action = "Global_Update",
-		TargetStore = self._storeName,
-		TargetKey = key,
-		Payload = payload,
-	}))
+	-- We wrap it in a real function, and keep it a single best-effort attempt.
+	withRetry(function()
+		MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
+			Action = "Global_Update",
+			TargetStore = self._storeName,
+			TargetKey = key,
+			Payload = payload,
+		})
+	end, 1)
 
 	return (success == true)
 end
 
 -- Forcibly requests eviction of a key without loading it yourself
 function Founder:ForceEjectKey(key: string)
-	withRetry(MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
-		Action = "Eject_Key",
-		TargetStore = self._storeName,
-		TargetKey = key,
-		OriginJobId = game.JobId ~= "" and game.JobId or "StudioInstance",
-	}))
+	-- Same bug as LoadSession's Eject_Key publish -- see the note there.
+	withRetry(function()
+		MessagingService:PublishAsync(PersonaStore.ClusterTopic, {
+			Action = "Eject_Key",
+			TargetStore = self._storeName,
+			TargetKey = key,
+			OriginJobId = game.JobId ~= "" and game.JobId or "StudioInstance",
+		})
+	end, 1)
 end
 
 -- Batch operation with improved cleanup
@@ -1210,7 +1229,7 @@ function OrderedFounder:GetSortedPage(ascending: boolean?, pageSize: number?, mi
 		warn("[OrderedFounder]: pageSize must be between 1 and 100 for store: " .. self._storeName)
 		return nil, nil
 	end
-	
+
 	local success, pages = withRetry(function()
 		return self._storageInstance:GetSortedAsync(ascending or false, pageSize or 50, minValue, maxValue)
 	end, 3)
@@ -1455,7 +1474,7 @@ function PersonaStore:Init()
 			task.wait(2)
 		end)
 	end
-	
+
 	print("[PersonaStore]: Engine started successfully!")
 end
 
