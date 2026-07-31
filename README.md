@@ -147,7 +147,7 @@ Players.PlayerAdded:Connect(function(player)
     kills.Name = "Kills"
 	kills.Value = session.Data.Kills
 	
-	session[player.UserId] = session
+	sessions[player.UserId] = session
 	
 	session:ListenToFieldChange(function(_, new, root)
 		if root == "Kills" then
@@ -207,7 +207,7 @@ Players.PlayerAdded:Connect(function(player)
     kills.Name = "Kills"
 	kills.Value = session.Data.Kills
 	
-	session[player.UserId] = session
+	sessions[player.UserId] = session
 	
 	session:ListenToFieldChange(function(_, new, root)
 		if root == "Kills" then
